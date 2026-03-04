@@ -1,0 +1,25 @@
+name: vector_db
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  # CUDA-enabled PyTorch (CUDA 12.1 runtime in the env)
+  - pytorch
+  - torchvision
+  - torchaudio
+  - pytorch-cuda=12.1
+  # Pin NumPy to 1.x so FAISS wheels load
+  - numpy=1.26.4
+  - pandas
+  - scipy
+  - scikit-learn
+  - tqdm
+  - sentencepiece
+  - ipykernel
+  - pip:
+      - faiss-cpu==1.7.4
+      - transformers==4.45.2
+      - sentence-transformers==2.7.0
