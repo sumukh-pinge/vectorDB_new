@@ -1,0 +1,78 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: vectordb-nq-minilm-dual-noadapt
+  namespace: designlab
+spec:
+  backoffLimit: 1
+  template:
+    metadata:
+      labels:
+        app: vectordb-nq
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: run
+        image: spinge/nrp-vectordb:20260304   # <-- CHANGE this tag
+        imagePullPolicy: IfNotPresent
+        command: ["/usr/local/bin/nrp-launch"]
+        args:
+          - python
+          - run_one_experiment.py
+          - --dataset
+          - nq
+          - --encoder
+          - all-MiniLM-L6-v2
+          - --mode
+          - dual
+          - --adapter
+          - "off"
+          - --bits_sq
+          - "4"
+          - --nlist
+          - "1024"
+          - --nprobe
+          - "32"
+          - --k2
+          - "1000"
+          - --kfinals
+          - "1,5,10,25,50,100"
+          - --ms
+          - "2,4,2"
+          - --alphas
+          - "2,2,2"
+        env:
+          - name: GIT_REPO
+            value: https://github.com/sumukh-pinge/vectorDB_new.git   # <-- CHANGE if needed
+          - name: GIT_REF
+            value: main
+          # Make HF cache persistent (optional but highly recommended)
+          - name: HF_HOME
+            value: /mnt/work/hf_cache
+          - name: TRANSFORMERS_CACHE
+            value: /mnt/work/hf_cache
+
+          # Your script defaults already match these, but keeping explicit is nice:
+          - name: DATA_ROOT
+            value: /mnt/work/VectorDB_MICRO/datasets/semantic
+          - name: INTERMEDIATE_ROOT
+            value: /mnt/work/VectorDB_MICRO/intermediate_data
+          - name: RUN_ROOT
+            value: /mnt/work/VectorDB_MICRO/DBAM/runs
+
+        resources:
+          requests:
+            cpu: "8"
+            memory: "64Gi"
+          limits:
+            cpu: "8"
+            memory: "96Gi"
+
+        volumeMounts:
+          - name: work
+            mountPath: /mnt/work
+
+      volumes:
+        - name: work
+          persistentVolumeClaim:
+            claimName: sumukh-4tb

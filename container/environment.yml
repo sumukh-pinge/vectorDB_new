@@ -1,0 +1,21 @@
+name: vector_db
+channels:
+  - pytorch
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - numpy=1.26.4
+  - pandas
+  - scipy
+  - scikit-learn
+  - tqdm
+  - sentencepiece
+  - pytorch
+  - torchvision
+  - torchaudio
+  - cpuonly
+  - pip:
+      - faiss-cpu==1.7.4
+      - transformers==4.45.2
+      - sentence-transformers==2.7.0
