@@ -13,7 +13,7 @@ spec:
       restartPolicy: Never
       containers:
       - name: run
-        image: spinge/nrp-vectordb:20260304   # <-- CHANGE this tag
+        image: spinge/nrp-beirnq:20251105-b708b40
         imagePullPolicy: IfNotPresent
         command: ["/usr/local/bin/nrp-launch"]
         args:
