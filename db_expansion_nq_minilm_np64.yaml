@@ -1,0 +1,94 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: vectordb-e2-dbexp-nq-minilm-np64
+  namespace: designlab
+spec:
+  backoffLimit: 1
+  template:
+    metadata:
+      labels:
+        app: vectordb-e2-dbexp
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: run
+        image: spinge/nrp-beirnq:20251105-b708b40
+        imagePullPolicy: IfNotPresent
+        command: ["/usr/local/bin/nrp-launch"]
+        args:
+          - python
+          - run_db_expansion_experiment.py
+          - --dataset
+          - nq
+          - --encoder
+          - all-MiniLM-L6-v2
+          - --seed
+          - "42"
+          - --run_label
+          - e2_db_expansion_nq_minilm_np64
+          - --holdout_doc_frac
+          - "0.20"
+          - --base_train_frac
+          - "0.80"
+          - --new_eval_frac
+          - "0.50"
+          - --bits_sq
+          - "4"
+          - --nlist
+          - "1024"
+          - --eval_nprobe
+          - "64"
+          - --k2
+          - "1000"
+          - --kfinals
+          - "10,25,50,100"
+          - --alphas
+          - "2,2,2"
+          - --ms_values
+          - "2,4,2;1,1,1"
+          - --adapter_mining_stages
+          - "dual,dual,dual"
+          - --adapter_mining_ms
+          - "2,4,2"
+          - --adapter_mining_nprobe
+          - "64"
+          - --adapter_neg_kfinal
+          - "10"
+          - --adapt_epochs
+          - "5"
+          - --adapt_lr
+          - "0.0005"
+          - --adapt_subset
+          - "50000"
+          - --adapt_qbatch
+          - "64"
+        env:
+          - name: GIT_REPO
+            value: https://github.com/sumukh-pinge/vectorDB_new.git
+          - name: GIT_REF
+            value: main
+          - name: HF_HOME
+            value: /mnt/work/hf_cache
+          - name: TRANSFORMERS_CACHE
+            value: /mnt/work/hf_cache
+          - name: DATA_ROOT
+            value: /mnt/work/VectorDB_MICRO/datasets/semantic
+          - name: INTERMEDIATE_ROOT
+            value: /mnt/work/VectorDB_MICRO/intermediate_data
+          - name: RUN_ROOT
+            value: /mnt/work/VectorDB_MICRO/DBAM/runs
+        resources:
+          requests:
+            cpu: "8"
+            memory: "64Gi"
+          limits:
+            cpu: "8"
+            memory: "96Gi"
+        volumeMounts:
+          - name: work
+            mountPath: /mnt/work
+      volumes:
+        - name: work
+          persistentVolumeClaim:
+            claimName: sumukh-4tb
