@@ -13,12 +13,14 @@ spec:
       restartPolicy: Never
       containers:
       - name: run
-        image: spinge/nrp-beirnq:20251105-b708b40
+        image: spinge/vectordb-new:20260304
         imagePullPolicy: IfNotPresent
         command: ["/usr/local/bin/nrp-launch"]
         args:
           - python
           - run_db_expansion_experiment.py
+          - --stage
+          - all
           - --dataset
           - nq
           - --encoder
@@ -26,7 +28,7 @@ spec:
           - --seed
           - "42"
           - --run_label
-          - e2_db_expansion_nq_minilm_np64
+          - e2_db_expansion_nq_single_sanity
           - --holdout_doc_frac
           - "0.20"
           - --base_train_frac
@@ -63,6 +65,10 @@ spec:
           - "50000"
           - --adapt_qbatch
           - "64"
+          - --wait_timeout_sec
+          - "43200"
+          - --wait_poll_sec
+          - "60"
         env:
           - name: GIT_REPO
             value: https://github.com/sumukh-pinge/vectorDB_new.git
@@ -77,14 +83,18 @@ spec:
           - name: INTERMEDIATE_ROOT
             value: /mnt/work/VectorDB_MICRO/intermediate_data
           - name: RUN_ROOT
-            value: /mnt/work/VectorDB_MICRO/DBAM/runs
+            value: /mnt/work/VectorDB_MICRO/DBAM/db_expansion_runs_20260605
+          - name: PYTHONUNBUFFERED
+            value: "1"
         resources:
           requests:
-            cpu: "8"
-            memory: "64Gi"
+            nvidia.com/gpu: 0
+            cpu: "4"
+            memory: "56Gi"
           limits:
-            cpu: "8"
-            memory: "96Gi"
+            nvidia.com/gpu: 0
+            cpu: "4"
+            memory: "64Gi"
         volumeMounts:
           - name: work
             mountPath: /mnt/work

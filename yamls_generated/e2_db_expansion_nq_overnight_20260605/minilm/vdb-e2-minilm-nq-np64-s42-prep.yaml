@@ -1,0 +1,132 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: vdb-e2-minilm-nq-np64-s42-prep
+  namespace: designlab
+  labels:
+    app: "vectordb-e2-dbexp"
+    dataset: "nq"
+    encoder: "minilm"
+    seed: "s42"
+    nprobe: "np64"
+    stage: "prep"
+    setting: "none"
+spec:
+  backoffLimit: 1
+  template:
+    metadata:
+      labels:
+        app: "vectordb-e2-dbexp"
+        dataset: "nq"
+        encoder: "minilm"
+        seed: "s42"
+        nprobe: "np64"
+        stage: "prep"
+        setting: "none"
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: run
+        image: spinge/vectordb-new:20260304
+        imagePullPolicy: IfNotPresent
+        command: ["/usr/local/bin/nrp-launch"]
+        args:
+          - "python"
+          - "run_db_expansion_experiment.py"
+          - "--stage"
+          - "prep"
+          - "--encoder"
+          - "all-MiniLM-L6-v2"
+          - "--seed"
+          - "42"
+          - "--eval_nprobe"
+          - "64"
+          - "--adapter_mining_nprobe"
+          - "64"
+          - "--dataset"
+          - "nq"
+          - "--run_label"
+          - "e2_db_expansion_nq_overnight_20260605"
+          - "--data_root"
+          - "/mnt/work/VectorDB_MICRO/datasets/semantic"
+          - "--intermediate_root"
+          - "/mnt/work/VectorDB_MICRO/intermediate_data"
+          - "--run_root"
+          - "/mnt/work/VectorDB_MICRO/DBAM/db_expansion_runs_20260605"
+          - "--holdout_doc_frac"
+          - "0.20"
+          - "--base_train_frac"
+          - "0.80"
+          - "--new_eval_frac"
+          - "0.50"
+          - "--bits_sq"
+          - "4"
+          - "--nlist"
+          - "1024"
+          - "--k2"
+          - "1000"
+          - "--kfinals"
+          - "10,25,50,100"
+          - "--alphas"
+          - "2,2,2"
+          - "--ms_values"
+          - "2,4,2;1,1,1"
+          - "--adapter_mining_stages"
+          - "dual,dual,dual"
+          - "--adapter_mining_ms"
+          - "2,4,2"
+          - "--adapter_neg_kfinal"
+          - "10"
+          - "--adapt_epochs"
+          - "5"
+          - "--adapt_lr"
+          - "5e-4"
+          - "--adapt_subset"
+          - "50000"
+          - "--adapt_qbatch"
+          - "64"
+          - "--tau"
+          - "1.0"
+          - "--beta"
+          - "6.0"
+          - "--gamma"
+          - "1.0"
+          - "--grad_clip"
+          - "1.0"
+          - "--wait_timeout_sec"
+          - "43200"
+          - "--wait_poll_sec"
+          - "60"
+        env:
+          - name: GIT_REPO
+            value: "https://github.com/sumukh-pinge/vectorDB_new.git"
+          - name: GIT_REF
+            value: "main"
+          - name: HF_HOME
+            value: "/mnt/work/hf_cache"
+          - name: TRANSFORMERS_CACHE
+            value: "/mnt/work/hf_cache"
+          - name: DATA_ROOT
+            value: "/mnt/work/VectorDB_MICRO/datasets/semantic"
+          - name: INTERMEDIATE_ROOT
+            value: "/mnt/work/VectorDB_MICRO/intermediate_data"
+          - name: RUN_ROOT
+            value: "/mnt/work/VectorDB_MICRO/DBAM/db_expansion_runs_20260605"
+          - name: PYTHONUNBUFFERED
+            value: "1"
+        resources:
+          requests:
+            nvidia.com/gpu: 0
+            cpu: "4"
+            memory: "56Gi"
+          limits:
+            nvidia.com/gpu: 0
+            cpu: "4"
+            memory: "64Gi"
+        volumeMounts:
+          - name: work
+            mountPath: /mnt/work
+      volumes:
+        - name: work
+          persistentVolumeClaim:
+            claimName: sumukh-4tb

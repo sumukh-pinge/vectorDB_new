@@ -432,8 +432,603 @@ def dataframe_to_markdown(df):
     return "\n".join([header_line, sep_line] + row_lines) + "\n"
 
 
-def main():
+def stage_tags(args):
+    encoder_tag = args.encoder.replace("/", "_")
+    adapter_mining_nprobe = args.adapter_mining_nprobe or args.eval_nprobe
+    split_tag = (
+        f"doc{frac_tag(1.0 - args.holdout_doc_frac)}_{frac_tag(args.holdout_doc_frac)}"
+        f"_neweval{frac_tag(args.new_eval_frac)}_seed{args.seed}"
+        f"_nlist{args.nlist}_b{args.bits_sq}"
+    )
+    run_tag = f"{split_tag}_np{args.eval_nprobe}_mine{adapter_mining_nprobe}"
+    inter_dir = os.path.join(args.intermediate_root, args.dataset, encoder_tag, "db_expansion", run_tag)
+    out_dir = os.path.join(
+        args.run_root,
+        args.dataset,
+        encoder_tag,
+        "results",
+        "db_expansion",
+        args.run_label,
+        f"np{args.eval_nprobe}",
+        run_tag,
+    )
+    slugs = {
+        "base": f"base_adapter_{args.dataset}_{encoder_tag}_{run_tag}",
+        "frozen": f"frozen_base_adapter_on_expanded_{args.dataset}_{encoder_tag}_{run_tag}",
+        "refreshed": f"refreshed_adapter_{args.dataset}_{encoder_tag}_{run_tag}",
+    }
+    return encoder_tag, split_tag, run_tag, inter_dir, out_dir, slugs
+
+
+def build_runtime(args):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    encoder_tag, split_tag, run_tag, inter_dir, out_dir, slugs = stage_tags(args)
+    os.makedirs(inter_dir, exist_ok=True)
+    os.makedirs(out_dir, exist_ok=True)
+    adapter_mining_nprobe = args.adapter_mining_nprobe or args.eval_nprobe
+    return {
+        "device": device,
+        "encoder_tag": encoder_tag,
+        "split_tag": split_tag,
+        "run_tag": run_tag,
+        "inter_dir": inter_dir,
+        "out_dir": out_dir,
+        "slugs": slugs,
+        "k_finals": sorted(set(parse_int_list(args.kfinals)) | {100}),
+        "alphas": parse_int_tuple(args.alphas),
+        "ms_values": parse_ms_values(args.ms_values),
+        "cfg": {
+            "device": device,
+            "intermediate_dir": inter_dir,
+            "alphas": parse_int_tuple(args.alphas),
+            "adapter_mining_stages": parse_str_tuple(args.adapter_mining_stages),
+            "adapter_mining_ms": parse_int_tuple(args.adapter_mining_ms),
+            "adapter_mining_nprobe": adapter_mining_nprobe,
+            "adapter_neg_kfinal": args.adapter_neg_kfinal,
+            "adapt_epochs": args.adapt_epochs,
+            "adapt_lr": args.adapt_lr,
+            "adapt_subset": args.adapt_subset,
+            "adapt_qbatch": args.adapt_qbatch,
+            "tau": args.tau,
+            "beta": args.beta,
+            "gamma": args.gamma,
+            "grad_clip": args.grad_clip,
+        },
+    }
+
+
+def artifact_paths(rt):
+    inter_dir = rt["inter_dir"]
+    return {
+        "prep_done": os.path.join(inter_dir, "prep_done.json"),
+        "split_meta": os.path.join(inter_dir, "split_meta.json"),
+        "base_ckpt": os.path.join(inter_dir, f"W_{rt['slugs']['base']}_adapter.pt"),
+        "frozen_ckpt": os.path.join(inter_dir, f"W_{rt['slugs']['frozen']}_adapter.pt"),
+        "refreshed_ckpt": os.path.join(inter_dir, f"W_{rt['slugs']['refreshed']}_adapter.pt"),
+    }
+
+
+def wait_for_path(path, timeout_sec, poll_sec=60):
+    start = time.time()
+    while True:
+        if os.path.exists(path):
+            return
+        elapsed = time.time() - start
+        if timeout_sec <= 0 or elapsed > timeout_sec:
+            raise TimeoutError(f"Timed out waiting for {path}")
+        print(f"waiting for {path} ({int(elapsed)}s elapsed)", flush=True)
+        time.sleep(poll_sec)
+
+
+def load_data(args, rt):
+    ds_dir = resolve_dataset_dir(args.data_root, args.dataset)
+    qrels_split, qrels_file = choose_qrels_file(ds_dir)
+    corpus_file = str(ds_dir / "corpus.jsonl")
+    queries_file = str(ds_dir / "queries.jsonl")
+    embed_path = os.path.join(
+        args.intermediate_root,
+        args.dataset,
+        rt["encoder_tag"],
+        f"passage_embeddings_{args.dataset}_{rt['encoder_tag']}.npy",
+    )
+    qembed_path = os.path.join(
+        args.intermediate_root,
+        args.dataset,
+        rt["encoder_tag"],
+        f"query_embeddings_{args.dataset}_{rt['encoder_tag']}_{qrels_split}.npy",
+    )
+
+    print(f"device: {rt['device']}", flush=True)
+    print(f"dataset: {args.dataset} qrels_split: {qrels_split}", flush=True)
+    print(f"encoder: {args.encoder}", flush=True)
+    print(f"intermediate: {rt['inter_dir']}", flush=True)
+    print(f"output: {rt['out_dir']}", flush=True)
+
+    encoder = SentenceTransformer(args.encoder, device=rt["device"])
+    passage_ids_all, embeddings_all = load_or_build_passage_embeddings(
+        corpus_file=corpus_file,
+        embed_path=embed_path,
+        encoder=encoder,
+        batch_size=args.passage_batch_size,
+    )
+    query_ids_all, queries_emb_all, query_to_gt_all, pos_qrels = load_or_build_query_embeddings(
+        queries_file=queries_file,
+        qrels_file=str(qrels_file),
+        qembed_path=qembed_path,
+        encoder=encoder,
+        batch_size=args.query_batch_size,
+    )
+    return {
+        "ds_dir": ds_dir,
+        "qrels_split": qrels_split,
+        "qrels_file": str(qrels_file),
+        "corpus_file": corpus_file,
+        "queries_file": queries_file,
+        "embed_path": embed_path,
+        "qembed_path": qembed_path,
+        "passage_ids_all": passage_ids_all,
+        "embeddings_all": l2norm(embeddings_all),
+        "query_ids_all": query_ids_all,
+        "queries_emb_all": l2norm(queries_emb_all),
+        "query_to_gt_all": query_to_gt_all,
+        "pos_qrels": pos_qrels,
+    }
+
+
+def build_split_data(args, data):
+    split = make_document_expansion_split(
+        passage_ids=data["passage_ids_all"],
+        query_ids=data["query_ids_all"],
+        query_to_gt=data["query_to_gt_all"],
+        holdout_doc_frac=args.holdout_doc_frac,
+        base_train_frac=args.base_train_frac,
+        new_eval_frac=args.new_eval_frac,
+        seed=args.seed,
+    )
+    base_ids, base_embeddings = subset_passages(data["passage_ids_all"], data["embeddings_all"], split["base_doc_ids"])
+    added_ids = sorted(split["added_doc_ids"])
+    expanded_ids, expanded_embeddings = data["passage_ids_all"], data["embeddings_all"]
+    expanded_doc_ids = set(str(pid) for pid in expanded_ids)
+    base_train_qids, base_train_qemb, base_train_q2gt = subset_queries(
+        data["query_ids_all"], data["queries_emb_all"], split["base_train_qids"], data["query_to_gt_all"], split["base_doc_ids"]
+    )
+    base_eval_qids, base_eval_qemb, base_eval_q2gt = subset_queries(
+        data["query_ids_all"], data["queries_emb_all"], split["base_eval_qids"], data["query_to_gt_all"], split["base_doc_ids"]
+    )
+    expanded_eval_qids, expanded_eval_qemb, expanded_eval_q2gt = subset_queries(
+        data["query_ids_all"], data["queries_emb_all"], split["expanded_eval_new_qids"], data["query_to_gt_all"], expanded_doc_ids
+    )
+    expanded_refresh_train_set = set(base_train_qids) | set(split["refresh_new_train_qids"])
+    expanded_train_qids, expanded_train_qemb, expanded_train_q2gt = subset_queries(
+        data["query_ids_all"], data["queries_emb_all"], expanded_refresh_train_set, data["query_to_gt_all"], expanded_doc_ids
+    )
+
+    if not base_train_qids:
+        raise RuntimeError("No base training queries with positives in Base DB.")
+    if not base_eval_qids:
+        raise RuntimeError("No base evaluation queries with positives in Base DB.")
+    if not expanded_eval_qids:
+        raise RuntimeError("No expanded/new-doc evaluation queries with positives in Expanded DB.")
+    if not expanded_train_qids and not args.skip_refreshed:
+        raise RuntimeError("No expanded training queries for refreshed adapter.")
+
+    return {
+        "split": split,
+        "base_ids": base_ids,
+        "base_embeddings": base_embeddings,
+        "added_ids": added_ids,
+        "expanded_ids": expanded_ids,
+        "expanded_embeddings": expanded_embeddings,
+        "expanded_doc_ids": expanded_doc_ids,
+        "base_train_qids": base_train_qids,
+        "base_train_qemb": base_train_qemb,
+        "base_train_q2gt": base_train_q2gt,
+        "base_eval_qids": base_eval_qids,
+        "base_eval_qemb": base_eval_qemb,
+        "base_eval_q2gt": base_eval_q2gt,
+        "expanded_eval_qids": expanded_eval_qids,
+        "expanded_eval_qemb": expanded_eval_qemb,
+        "expanded_eval_q2gt": expanded_eval_q2gt,
+        "expanded_train_qids": expanded_train_qids,
+        "expanded_train_qemb": expanded_train_qemb,
+        "expanded_train_q2gt": expanded_train_q2gt,
+    }
+
+
+def write_split_meta(args, rt, data, split_data, elapsed):
+    paths = artifact_paths(rt)
+    meta = {
+        "goal": "D-NOVA E-2 database expansion prep artifacts",
+        "dataset": args.dataset,
+        "encoder": args.encoder,
+        "encoder_tag": rt["encoder_tag"],
+        "seed": args.seed,
+        "run_label": args.run_label,
+        "qrels_split": data["qrels_split"],
+        "run_tag": rt["run_tag"],
+        "settings": {
+            "index": "IVF-Flat",
+            "nlist": args.nlist,
+            "eval_nprobe": args.eval_nprobe,
+            "adapter_mining_nprobe": rt["cfg"]["adapter_mining_nprobe"],
+            "k2": args.k2,
+            "kfinals": rt["k_finals"],
+            "alphas": rt["alphas"],
+            "ms_values": rt["ms_values"],
+            "holdout_doc_frac": args.holdout_doc_frac,
+            "base_train_frac": args.base_train_frac,
+            "new_eval_frac": args.new_eval_frac,
+            "refreshed_adapter_training": "retrained on expanded DB training setup",
+            "storage_side_dts_pipeline_changed": False,
+        },
+        "counts": {
+            "passages_total": len(data["passage_ids_all"]),
+            "base_docs": len(split_data["base_ids"]),
+            "added_docs": len(split_data["added_ids"]),
+            "queries_total_with_qrels": len(data["query_ids_all"]),
+            "positive_qrels": int(len(data["pos_qrels"])),
+            "base_train_queries": len(split_data["base_train_qids"]),
+            "base_eval_queries": len(split_data["base_eval_qids"]),
+            "refresh_new_doc_train_queries": len(split_data["split"]["refresh_new_train_qids"]),
+            "expanded_train_queries": len(split_data["expanded_train_qids"]),
+            "expanded_new_doc_eval_queries": len(split_data["expanded_eval_qids"]),
+        },
+        "adapter_slugs": rt["slugs"],
+        "paths": {
+            "dataset_dir": str(data["ds_dir"]),
+            "corpus_file": data["corpus_file"],
+            "queries_file": data["queries_file"],
+            "qrels_file": data["qrels_file"],
+            "passage_embedding_cache": data["embed_path"],
+            "query_embedding_cache": data["qembed_path"],
+            "intermediate_dir": rt["inter_dir"],
+            "output_dir": rt["out_dir"],
+            **paths,
+        },
+        "timing_sec": {
+            "prep": elapsed,
+        },
+    }
+    with open(paths["split_meta"], "w", encoding="utf-8") as handle:
+        json.dump(meta, handle, indent=2)
+    with open(paths["prep_done"], "w", encoding="utf-8") as handle:
+        json.dump({"status": "done", "split_meta": paths["split_meta"], "timestamp": time.time()}, handle, indent=2)
+    print("saved:", paths["split_meta"], flush=True)
+    print("saved:", paths["prep_done"], flush=True)
+
+
+def run_prep(args, rt):
+    start = time.time()
+    data = load_data(args, rt)
+    split_data = build_split_data(args, data)
+
+    print("split counts:", flush=True)
+    print(f"  base docs: {len(split_data['base_ids'])}", flush=True)
+    print(f"  added docs: {len(split_data['added_ids'])}", flush=True)
+    print(f"  base train queries: {len(split_data['base_train_qids'])}", flush=True)
+    print(f"  base eval queries: {len(split_data['base_eval_qids'])}", flush=True)
+    print(f"  refresh new-doc train queries: {len(split_data['split']['refresh_new_train_qids'])}", flush=True)
+    print(f"  expanded/new-doc eval queries: {len(split_data['expanded_eval_qids'])}", flush=True)
+
+    pipeline_base_train = build_pipeline_baseline(
+        slug=f"base_train_{rt['run_tag']}",
+        embeddings=split_data["base_embeddings"],
+        queries_emb_sample=split_data["base_train_qemb"],
+        passage_ids_sample=split_data["base_ids"],
+        bits_sq=args.bits_sq,
+        nlist=args.nlist,
+    )
+    train_adapter_if_needed(
+        slug=rt["slugs"]["base"],
+        embeddings=split_data["base_embeddings"],
+        queries_emb=split_data["base_train_qemb"],
+        passage_ids=split_data["base_ids"],
+        query_ids=split_data["base_train_qids"],
+        query_to_gt=split_data["base_train_q2gt"],
+        pipeline_train=pipeline_base_train,
+        cfg=rt["cfg"],
+    )
+    del pipeline_base_train
+
+    ensure_adapter_alias(rt["inter_dir"], rt["slugs"]["base"], rt["slugs"]["frozen"])
+
+    if not args.skip_refreshed:
+        pipeline_expanded_train = build_pipeline_baseline(
+            slug=f"expanded_train_refreshed_{rt['run_tag']}",
+            embeddings=split_data["expanded_embeddings"],
+            queries_emb_sample=split_data["expanded_train_qemb"],
+            passage_ids_sample=split_data["expanded_ids"],
+            bits_sq=args.bits_sq,
+            nlist=args.nlist,
+        )
+        train_adapter_if_needed(
+            slug=rt["slugs"]["refreshed"],
+            embeddings=split_data["expanded_embeddings"],
+            queries_emb=split_data["expanded_train_qemb"],
+            passage_ids=split_data["expanded_ids"],
+            query_ids=split_data["expanded_train_qids"],
+            query_to_gt=split_data["expanded_train_q2gt"],
+            pipeline_train=pipeline_expanded_train,
+            cfg=rt["cfg"],
+        )
+        del pipeline_expanded_train
+
+    write_split_meta(args, rt, data, split_data, time.time() - start)
+
+
+EVAL_SETTINGS = {
+    "base_none": ("Base DB", "none"),
+    "expanded_none": ("Expanded DB", "none"),
+    "expanded_frozen": ("Expanded DB", "frozen base adapter"),
+    "expanded_refreshed": ("Expanded DB", "refreshed adapter"),
+}
+
+
+def build_eval_pipeline(args, rt, split_data):
+    if args.eval_setting == "base_none":
+        pipeline = build_pipeline_baseline(
+            slug=f"base_eval_no_adapter_{rt['run_tag']}",
+            embeddings=split_data["base_embeddings"],
+            queries_emb_sample=split_data["base_eval_qemb"],
+            passage_ids_sample=split_data["base_ids"],
+            bits_sq=args.bits_sq,
+            nlist=args.nlist,
+        )
+        return pipeline, split_data["base_eval_qids"], split_data["base_eval_q2gt"], None
+
+    if args.eval_setting == "expanded_none":
+        pipeline = build_pipeline_baseline(
+            slug=f"expanded_no_adapter_{rt['run_tag']}",
+            embeddings=split_data["expanded_embeddings"],
+            queries_emb_sample=split_data["expanded_eval_qemb"],
+            passage_ids_sample=split_data["expanded_ids"],
+            bits_sq=args.bits_sq,
+            nlist=args.nlist,
+        )
+        return pipeline, split_data["expanded_eval_qids"], split_data["expanded_eval_q2gt"], None
+
+    if args.eval_setting == "expanded_frozen":
+        ensure_adapter_alias(rt["inter_dir"], rt["slugs"]["base"], rt["slugs"]["frozen"])
+        pipeline, preproc_path = load_or_build_pipeline_for_adapter(
+            trial_slug=rt["slugs"]["frozen"],
+            embeddings=split_data["expanded_embeddings"],
+            queries_emb_sample=split_data["expanded_eval_qemb"],
+            passage_ids_sample=split_data["expanded_ids"],
+            nlist=args.nlist,
+            bits_sq=args.bits_sq,
+            intermediate_dir=rt["inter_dir"],
+            device=rt["device"],
+            fallback_to_baseline=False,
+        )
+        return pipeline, split_data["expanded_eval_qids"], split_data["expanded_eval_q2gt"], preproc_path
+
+    if args.eval_setting == "expanded_refreshed":
+        pipeline, preproc_path = load_or_build_pipeline_for_adapter(
+            trial_slug=rt["slugs"]["refreshed"],
+            embeddings=split_data["expanded_embeddings"],
+            queries_emb_sample=split_data["expanded_eval_qemb"],
+            passage_ids_sample=split_data["expanded_ids"],
+            nlist=args.nlist,
+            bits_sq=args.bits_sq,
+            intermediate_dir=rt["inter_dir"],
+            device=rt["device"],
+            fallback_to_baseline=False,
+        )
+        return pipeline, split_data["expanded_eval_qids"], split_data["expanded_eval_q2gt"], preproc_path
+
+    raise ValueError(f"Unsupported eval_setting: {args.eval_setting}")
+
+
+def run_eval(args, rt):
+    paths = artifact_paths(rt)
+    wait_for_path(paths["prep_done"], args.wait_timeout_sec, args.wait_poll_sec)
+    if args.eval_setting == "expanded_frozen":
+        wait_for_path(paths["frozen_ckpt"], args.wait_timeout_sec, args.wait_poll_sec)
+    if args.eval_setting == "expanded_refreshed":
+        wait_for_path(paths["refreshed_ckpt"], args.wait_timeout_sec, args.wait_poll_sec)
+
+    start = time.time()
+    data = load_data(args, rt)
+    split_data = build_split_data(args, data)
+    pipeline, eval_qids, eval_q2gt, preproc_path = build_eval_pipeline(args, rt, split_data)
+
+    setting, adapter = EVAL_SETTINGS[args.eval_setting]
+    setting_slug = setting.lower().replace(" ", "_")
+    adapter_slug = adapter.lower().replace(" ", "_")
+    rows = []
+
+    ivf_name = f"{args.eval_setting}_np{args.eval_nprobe}_ivf"
+    ivf_metrics = eval_mode(
+        name=ivf_name,
+        pipeline=pipeline,
+        query_ids=eval_qids,
+        query_to_gt=eval_q2gt,
+        results_dir=rt["out_dir"],
+        nprobe=args.eval_nprobe,
+        k2=args.k2,
+        k_finals=rt["k_finals"],
+        alphas=rt["alphas"],
+        stages=("ivf", "ivf", "ivf"),
+        ms=(1, 1, 1),
+    )
+    rows.append({
+        "Setting": setting,
+        "Adapter": adapter,
+        "Retrieval": "IVF",
+        "ms": "1,1,1",
+        "eval_setting": args.eval_setting,
+        **ivf_metrics,
+    })
+
+    for ms in rt["ms_values"]:
+        label = ms_label(ms)
+        dts_name = f"{args.eval_setting}_np{args.eval_nprobe}_{label.lower()}"
+        dts_metrics = eval_mode(
+            name=dts_name,
+            pipeline=pipeline,
+            query_ids=eval_qids,
+            query_to_gt=eval_q2gt,
+            results_dir=rt["out_dir"],
+            nprobe=args.eval_nprobe,
+            k2=args.k2,
+            k_finals=rt["k_finals"],
+            alphas=rt["alphas"],
+            stages=("dual", "dual", "dual"),
+            ms=ms,
+        )
+        rows.append({
+            "Setting": setting,
+            "Adapter": adapter,
+            "Retrieval": label,
+            "ms": ",".join(map(str, ms)),
+            "eval_setting": args.eval_setting,
+            **dts_metrics,
+        })
+
+    eval_dir = os.path.join(rt["out_dir"], "eval_parts")
+    os.makedirs(eval_dir, exist_ok=True)
+    csv_path = os.path.join(eval_dir, f"{args.eval_setting}.csv")
+    meta_path = os.path.join(eval_dir, f"{args.eval_setting}.meta.json")
+    pd.DataFrame(rows).to_csv(csv_path, index=False)
+    with open(meta_path, "w", encoding="utf-8") as handle:
+        json.dump({
+            "setting": setting,
+            "adapter": adapter,
+            "eval_setting": args.eval_setting,
+            "rows_csv": csv_path,
+            "preproc_path": preproc_path,
+            "eval_queries": len(eval_qids),
+            "timing_sec": {"eval_job": time.time() - start},
+        }, handle, indent=2)
+    print("saved:", csv_path, flush=True)
+    print("saved:", meta_path, flush=True)
+
+
+def summarize_one(args, rt):
+    paths = artifact_paths(rt)
+    wait_for_path(paths["prep_done"], args.wait_timeout_sec, args.wait_poll_sec)
+    eval_dir = os.path.join(rt["out_dir"], "eval_parts")
+    frames = []
+    for setting in EVAL_SETTINGS:
+        part = os.path.join(eval_dir, f"{setting}.csv")
+        wait_for_path(part, args.wait_timeout_sec, args.wait_poll_sec)
+        frames.append(pd.read_csv(part))
+
+    long_df = pd.concat(frames, ignore_index=True)
+    table_inputs = {}
+    for (setting, adapter), group in long_df.groupby(["Setting", "Adapter"]):
+        ivf_rows = group[group["Retrieval"] == "IVF"]
+        dts_rows = group[group["Retrieval"].astype(str).str.startswith("DTS")]
+        if ivf_rows.empty:
+            continue
+        ivf_metrics = ivf_rows.iloc[0].to_dict()
+        dts_metrics_by_label = {
+            row["Retrieval"]: row.to_dict()
+            for _, row in dts_rows.iterrows()
+        }
+        table_inputs[(setting, adapter)] = (ivf_metrics, dts_metrics_by_label)
+
+    expanded_no_ivf, expanded_no_dts = table_inputs[("Expanded DB", "none")]
+    expanded_no_gap_by_label = {}
+    for label, metrics in expanded_no_dts.items():
+        expanded_no_gap_by_label[label] = float(metrics.get("R@100", np.nan)) - float(expanded_no_ivf.get("R@100", np.nan))
+
+    table_rows = []
+    for setting, adapter in [
+        ("Base DB", "none"),
+        ("Expanded DB", "none"),
+        ("Expanded DB", "frozen base adapter"),
+        ("Expanded DB", "refreshed adapter"),
+    ]:
+        ivf_metrics, dts_metrics_by_label = table_inputs[(setting, adapter)]
+        dts_r100_by_label = {
+            label: metrics.get("R@100")
+            for label, metrics in dts_metrics_by_label.items()
+        }
+        table_rows.append(final_table_row(setting, adapter, ivf_metrics.get("R@100"), dts_r100_by_label, expanded_no_gap_by_label))
+
+    final_df = pd.DataFrame(table_rows)
+    long_csv = os.path.join(rt["out_dir"], "summary_long.csv")
+    final_csv = os.path.join(rt["out_dir"], "final_rebuttal_table.csv")
+    final_md = os.path.join(rt["out_dir"], "final_rebuttal_table.md")
+    long_df.to_csv(long_csv, index=False)
+    final_df.to_csv(final_csv, index=False)
+    with open(final_md, "w", encoding="utf-8") as handle:
+        handle.write(dataframe_to_markdown(final_df))
+    print("saved:", long_csv, flush=True)
+    print("saved:", final_csv, flush=True)
+    print("saved:", final_md, flush=True)
+
+
+def run_all(args, rt):
+    run_prep(args, rt)
+    for setting in EVAL_SETTINGS:
+        args.eval_setting = setting
+        run_eval(args, rt)
+    summarize_one(args, rt)
+
+
+def run_aggregate(args, rt):
+    root = os.path.join(args.run_root, args.dataset, rt["encoder_tag"], "results", "db_expansion", args.run_label)
+    start = time.time()
+    while True:
+        csv_paths = list(Path(root).glob("np*/**/final_rebuttal_table.csv"))
+        if len(csv_paths) >= args.aggregate_expected_tables:
+            break
+        elapsed = time.time() - start
+        if args.wait_timeout_sec <= 0 or elapsed > args.wait_timeout_sec:
+            raise TimeoutError(
+                f"Timed out waiting for {args.aggregate_expected_tables} final tables under {root}; found {len(csv_paths)}"
+            )
+        print(
+            f"waiting for aggregate inputs under {root}: found {len(csv_paths)}/{args.aggregate_expected_tables}",
+            flush=True,
+        )
+        time.sleep(args.wait_poll_sec)
+
+    frames = []
+    for csv_path in csv_paths:
+        df = pd.read_csv(csv_path)
+        parts = csv_path.parts
+        nprobe = next((p for p in parts if p.startswith("np")), "")
+        run_tag = csv_path.parent.name
+        df.insert(0, "run_tag", run_tag)
+        df.insert(0, "nprobe", nprobe)
+        frames.append(df)
+    if not frames:
+        raise FileNotFoundError(f"No final_rebuttal_table.csv files found under {root}")
+
+    all_df = pd.concat(frames, ignore_index=True)
+    metric_cols = [
+        "IVF R@100",
+        "DTS111 R@100",
+        "DTS111-IVF Gap",
+        "DTS242 R@100",
+        "DTS242-IVF Gap",
+    ]
+    numeric = all_df.copy()
+    for col in metric_cols:
+        numeric[col] = pd.to_numeric(numeric[col], errors="coerce")
+    group_cols = ["nprobe", "Setting", "Adapter"]
+    agg = numeric.groupby(group_cols, as_index=False)[metric_cols].agg(["mean", "std"])
+    agg.columns = [
+        "_".join([str(x) for x in col if x != ""]).rstrip("_") if isinstance(col, tuple) else col
+        for col in agg.columns
+    ]
+    out_dir = os.path.join(root, "aggregate")
+    os.makedirs(out_dir, exist_ok=True)
+    all_csv = os.path.join(out_dir, "all_final_tables.csv")
+    agg_csv = os.path.join(out_dir, "aggregate_mean_std.csv")
+    all_df.to_csv(all_csv, index=False)
+    agg.to_csv(agg_csv, index=False)
+    print("saved:", all_csv, flush=True)
+    print("saved:", agg_csv, flush=True)
+
+
+def build_parser():
     parser = argparse.ArgumentParser("Run D-NOVA E-2 database expansion experiment.")
+    parser.add_argument("--stage", choices=["all", "prep", "eval", "summarize", "aggregate"], default="all")
+    parser.add_argument("--eval_setting", choices=list(EVAL_SETTINGS.keys()), default="expanded_none")
     parser.add_argument("--dataset", default="nq")
     parser.add_argument("--encoder", default="all-MiniLM-L6-v2")
     parser.add_argument("--seed", type=int, default=42)
@@ -470,386 +1065,26 @@ def main():
     parser.add_argument("--gamma", type=float, default=1.0)
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--skip_refreshed", action="store_true")
+    parser.add_argument("--wait_timeout_sec", type=int, default=43200)
+    parser.add_argument("--wait_poll_sec", type=int, default=60)
+    parser.add_argument("--aggregate_expected_tables", type=int, default=1)
+    return parser
+
+
+def main():
+    parser = build_parser()
     args = parser.parse_args()
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    encoder_tag = args.encoder.replace("/", "_")
-    k_finals = sorted(set(parse_int_list(args.kfinals)) | {100})
-    alphas = parse_int_tuple(args.alphas)
-    ms_values = parse_ms_values(args.ms_values)
-    adapter_mining_nprobe = args.adapter_mining_nprobe or args.eval_nprobe
-
-    split_tag = (
-        f"doc{frac_tag(1.0 - args.holdout_doc_frac)}_{frac_tag(args.holdout_doc_frac)}"
-        f"_neweval{frac_tag(args.new_eval_frac)}_seed{args.seed}"
-        f"_nlist{args.nlist}_b{args.bits_sq}"
-    )
-    inter_dir = os.path.join(args.intermediate_root, args.dataset, encoder_tag, "db_expansion", split_tag)
-    out_dir = os.path.join(
-        args.run_root,
-        args.dataset,
-        encoder_tag,
-        "results",
-        "db_expansion",
-        args.run_label,
-        f"np{args.eval_nprobe}",
-        split_tag,
-    )
-    os.makedirs(inter_dir, exist_ok=True)
-    os.makedirs(out_dir, exist_ok=True)
-
-    cfg = {
-        "device": device,
-        "intermediate_dir": inter_dir,
-        "alphas": alphas,
-        "adapter_mining_stages": parse_str_tuple(args.adapter_mining_stages),
-        "adapter_mining_ms": parse_int_tuple(args.adapter_mining_ms),
-        "adapter_mining_nprobe": adapter_mining_nprobe,
-        "adapter_neg_kfinal": args.adapter_neg_kfinal,
-        "adapt_epochs": args.adapt_epochs,
-        "adapt_lr": args.adapt_lr,
-        "adapt_subset": args.adapt_subset,
-        "adapt_qbatch": args.adapt_qbatch,
-        "tau": args.tau,
-        "beta": args.beta,
-        "gamma": args.gamma,
-        "grad_clip": args.grad_clip,
-    }
-
-    start = time.time()
-    ds_dir = resolve_dataset_dir(args.data_root, args.dataset)
-    qrels_split, qrels_file = choose_qrels_file(ds_dir)
-    corpus_file = str(ds_dir / "corpus.jsonl")
-    queries_file = str(ds_dir / "queries.jsonl")
-    embed_path = os.path.join(
-        args.intermediate_root,
-        args.dataset,
-        encoder_tag,
-        f"passage_embeddings_{args.dataset}_{encoder_tag}.npy",
-    )
-    qembed_path = os.path.join(
-        args.intermediate_root,
-        args.dataset,
-        encoder_tag,
-        f"query_embeddings_{args.dataset}_{encoder_tag}_{qrels_split}.npy",
-    )
-
-    print(f"device: {device}", flush=True)
-    print(f"dataset: {args.dataset} qrels_split: {qrels_split}", flush=True)
-    print(f"encoder: {args.encoder}", flush=True)
-    print(f"output: {out_dir}", flush=True)
-
-    encoder = SentenceTransformer(args.encoder, device=device)
-    passage_ids_all, embeddings_all = load_or_build_passage_embeddings(
-        corpus_file=corpus_file,
-        embed_path=embed_path,
-        encoder=encoder,
-        batch_size=args.passage_batch_size,
-    )
-    query_ids_all, queries_emb_all, query_to_gt_all, pos_qrels = load_or_build_query_embeddings(
-        queries_file=queries_file,
-        qrels_file=str(qrels_file),
-        qembed_path=qembed_path,
-        encoder=encoder,
-        batch_size=args.query_batch_size,
-    )
-    embeddings_all = l2norm(embeddings_all)
-    queries_emb_all = l2norm(queries_emb_all)
-
-    split = make_document_expansion_split(
-        passage_ids=passage_ids_all,
-        query_ids=query_ids_all,
-        query_to_gt=query_to_gt_all,
-        holdout_doc_frac=args.holdout_doc_frac,
-        base_train_frac=args.base_train_frac,
-        new_eval_frac=args.new_eval_frac,
-        seed=args.seed,
-    )
-
-    base_ids, base_embeddings = subset_passages(passage_ids_all, embeddings_all, split["base_doc_ids"])
-    added_ids = sorted(split["added_doc_ids"])
-    expanded_ids, expanded_embeddings = passage_ids_all, embeddings_all
-    expanded_doc_ids = set(str(pid) for pid in expanded_ids)
-
-    base_train_qids, base_train_qemb, base_train_q2gt = subset_queries(
-        query_ids_all, queries_emb_all, split["base_train_qids"], query_to_gt_all, split["base_doc_ids"]
-    )
-    base_eval_qids, base_eval_qemb, base_eval_q2gt = subset_queries(
-        query_ids_all, queries_emb_all, split["base_eval_qids"], query_to_gt_all, split["base_doc_ids"]
-    )
-    expanded_eval_qids, expanded_eval_qemb, expanded_eval_q2gt = subset_queries(
-        query_ids_all, queries_emb_all, split["expanded_eval_new_qids"], query_to_gt_all, expanded_doc_ids
-    )
-
-    expanded_refresh_train_set = set(base_train_qids) | set(split["refresh_new_train_qids"])
-    expanded_train_qids, expanded_train_qemb, expanded_train_q2gt = subset_queries(
-        query_ids_all, queries_emb_all, expanded_refresh_train_set, query_to_gt_all, expanded_doc_ids
-    )
-
-    if not base_train_qids:
-        raise RuntimeError("No base training queries with positives in Base DB.")
-    if not base_eval_qids:
-        raise RuntimeError("No base evaluation queries with positives in Base DB.")
-    if not expanded_eval_qids:
-        raise RuntimeError("No expanded/new-doc evaluation queries with positives in Expanded DB.")
-    if not expanded_train_qids and not args.skip_refreshed:
-        raise RuntimeError("No expanded training queries for refreshed adapter.")
-
-    print("split counts:", flush=True)
-    print(f"  base docs: {len(base_ids)}", flush=True)
-    print(f"  added docs: {len(added_ids)}", flush=True)
-    print(f"  base train queries: {len(base_train_qids)}", flush=True)
-    print(f"  base eval queries: {len(base_eval_qids)}", flush=True)
-    print(f"  refresh new-doc train queries: {len(split['refresh_new_train_qids'])}", flush=True)
-    print(f"  expanded/new-doc eval queries: {len(expanded_eval_qids)}", flush=True)
-
-    base_adapter_slug = f"base_adapter_{args.dataset}_{encoder_tag}_{split_tag}"
-    frozen_eval_slug = f"frozen_base_adapter_on_expanded_{args.dataset}_{encoder_tag}_{split_tag}"
-    refreshed_adapter_slug = f"refreshed_adapter_{args.dataset}_{encoder_tag}_{split_tag}"
-
-    pipeline_base_train = build_pipeline_baseline(
-        slug=f"base_train_{split_tag}",
-        embeddings=base_embeddings,
-        queries_emb_sample=base_train_qemb,
-        passage_ids_sample=base_ids,
-        bits_sq=args.bits_sq,
-        nlist=args.nlist,
-    )
-    train_adapter_if_needed(
-        slug=base_adapter_slug,
-        embeddings=base_embeddings,
-        queries_emb=base_train_qemb,
-        passage_ids=base_ids,
-        query_ids=base_train_qids,
-        query_to_gt=base_train_q2gt,
-        pipeline_train=pipeline_base_train,
-        cfg=cfg,
-    )
-
-    setting_specs = []
-    pipeline_base_eval = build_pipeline_baseline(
-        slug=f"base_eval_no_adapter_{split_tag}",
-        embeddings=base_embeddings,
-        queries_emb_sample=base_eval_qemb,
-        passage_ids_sample=base_ids,
-        bits_sq=args.bits_sq,
-        nlist=args.nlist,
-    )
-    setting_specs.append(("Base DB", "none", pipeline_base_eval, base_eval_qids, base_eval_q2gt))
-
-    pipeline_expanded_no = build_pipeline_baseline(
-        slug=f"expanded_no_adapter_{split_tag}",
-        embeddings=expanded_embeddings,
-        queries_emb_sample=expanded_eval_qemb,
-        passage_ids_sample=expanded_ids,
-        bits_sq=args.bits_sq,
-        nlist=args.nlist,
-    )
-    setting_specs.append(("Expanded DB", "none", pipeline_expanded_no, expanded_eval_qids, expanded_eval_q2gt))
-
-    ensure_adapter_alias(inter_dir, base_adapter_slug, frozen_eval_slug)
-    pipeline_frozen_eval, frozen_preproc = load_or_build_pipeline_for_adapter(
-        trial_slug=frozen_eval_slug,
-        embeddings=expanded_embeddings,
-        queries_emb_sample=expanded_eval_qemb,
-        passage_ids_sample=expanded_ids,
-        nlist=args.nlist,
-        bits_sq=args.bits_sq,
-        intermediate_dir=inter_dir,
-        device=device,
-        fallback_to_baseline=False,
-    )
-    setting_specs.append(("Expanded DB", "frozen base adapter", pipeline_frozen_eval, expanded_eval_qids, expanded_eval_q2gt))
-
-    refreshed_preproc = None
-    if not args.skip_refreshed:
-        pipeline_expanded_train = build_pipeline_baseline(
-            slug=f"expanded_train_refreshed_{split_tag}",
-            embeddings=expanded_embeddings,
-            queries_emb_sample=expanded_train_qemb,
-            passage_ids_sample=expanded_ids,
-            bits_sq=args.bits_sq,
-            nlist=args.nlist,
-        )
-        train_adapter_if_needed(
-            slug=refreshed_adapter_slug,
-            embeddings=expanded_embeddings,
-            queries_emb=expanded_train_qemb,
-            passage_ids=expanded_ids,
-            query_ids=expanded_train_qids,
-            query_to_gt=expanded_train_q2gt,
-            pipeline_train=pipeline_expanded_train,
-            cfg=cfg,
-        )
-        pipeline_refreshed_eval, refreshed_preproc = load_or_build_pipeline_for_adapter(
-            trial_slug=refreshed_adapter_slug,
-            embeddings=expanded_embeddings,
-            queries_emb_sample=expanded_eval_qemb,
-            passage_ids_sample=expanded_ids,
-            nlist=args.nlist,
-            bits_sq=args.bits_sq,
-            intermediate_dir=inter_dir,
-            device=device,
-            fallback_to_baseline=False,
-        )
-        setting_specs.append(("Expanded DB", "refreshed adapter", pipeline_refreshed_eval, expanded_eval_qids, expanded_eval_q2gt))
-
-    long_rows = []
-    table_inputs = {}
-    for setting, adapter, pipeline, eval_qids, eval_q2gt in setting_specs:
-        setting_slug = setting.lower().replace(" ", "_")
-        adapter_slug = adapter.lower().replace(" ", "_")
-        ivf_name = f"{setting_slug}_{adapter_slug}_np{args.eval_nprobe}_ivf"
-        ivf_metrics = eval_mode(
-            name=ivf_name,
-            pipeline=pipeline,
-            query_ids=eval_qids,
-            query_to_gt=eval_q2gt,
-            results_dir=out_dir,
-            nprobe=args.eval_nprobe,
-            k2=args.k2,
-            k_finals=k_finals,
-            alphas=alphas,
-            stages=("ivf", "ivf", "ivf"),
-            ms=(1, 1, 1),
-        )
-        dts_metrics_by_label = {}
-        long_rows.append({
-            "Setting": setting,
-            "Adapter": adapter,
-            "Retrieval": "IVF",
-            "ms": "1,1,1",
-            **ivf_metrics,
-        })
-        for ms in ms_values:
-            label = ms_label(ms)
-            dts_name = f"{setting_slug}_{adapter_slug}_np{args.eval_nprobe}_{label.lower()}"
-            dts_metrics = eval_mode(
-                name=dts_name,
-                pipeline=pipeline,
-                query_ids=eval_qids,
-                query_to_gt=eval_q2gt,
-                results_dir=out_dir,
-                nprobe=args.eval_nprobe,
-                k2=args.k2,
-                k_finals=k_finals,
-                alphas=alphas,
-                stages=("dual", "dual", "dual"),
-                ms=ms,
-            )
-            dts_metrics_by_label[label] = dts_metrics
-            long_rows.append({
-                "Setting": setting,
-                "Adapter": adapter,
-                "Retrieval": label,
-                "ms": ",".join(map(str, ms)),
-                **dts_metrics,
-            })
-        table_inputs[(setting, adapter)] = (ivf_metrics, dts_metrics_by_label)
-
-    expanded_no_ivf, expanded_no_dts = table_inputs[("Expanded DB", "none")]
-    expanded_no_gap_by_label = {}
-    for label, metrics in expanded_no_dts.items():
-        expanded_no_gap_by_label[label] = float(metrics.get("R@100", np.nan)) - float(expanded_no_ivf.get("R@100", np.nan))
-
-    table_rows = []
-    for setting, adapter in [
-        ("Base DB", "none"),
-        ("Expanded DB", "none"),
-        ("Expanded DB", "frozen base adapter"),
-        ("Expanded DB", "refreshed adapter"),
-    ]:
-        if (setting, adapter) not in table_inputs:
-            continue
-        ivf_metrics, dts_metrics_by_label = table_inputs[(setting, adapter)]
-        dts_r100_by_label = {
-            label: metrics.get("R@100")
-            for label, metrics in dts_metrics_by_label.items()
-        }
-        table_rows.append(final_table_row(
-            setting=setting,
-            adapter=adapter,
-            ivf_r100=ivf_metrics.get("R@100"),
-            dts_r100_by_label=dts_r100_by_label,
-            expanded_no_gap_by_label=expanded_no_gap_by_label,
-        ))
-
-    long_df = pd.DataFrame(long_rows)
-    final_df = pd.DataFrame(table_rows)
-    long_csv = os.path.join(out_dir, "summary_long.csv")
-    final_csv = os.path.join(out_dir, "final_rebuttal_table.csv")
-    final_md = os.path.join(out_dir, "final_rebuttal_table.md")
-    long_df.to_csv(long_csv, index=False)
-    final_df.to_csv(final_csv, index=False)
-    with open(final_md, "w", encoding="utf-8") as handle:
-        handle.write(dataframe_to_markdown(final_df))
-
-    meta = {
-        "goal": "D-NOVA E-2 database expansion with frozen and refreshed adapters",
-        "dataset": args.dataset,
-        "encoder": args.encoder,
-        "encoder_tag": encoder_tag,
-        "qrels_split": qrels_split,
-        "seed": args.seed,
-        "run_label": args.run_label,
-        "settings": {
-            "index": "IVF-Flat",
-            "nlist": args.nlist,
-            "eval_nprobe": args.eval_nprobe,
-            "k2": args.k2,
-            "kfinals": k_finals,
-            "alphas": alphas,
-            "ms_values": ms_values,
-            "holdout_doc_frac": args.holdout_doc_frac,
-            "base_train_frac": args.base_train_frac,
-            "new_eval_frac": args.new_eval_frac,
-            "refreshed_adapter_training": "retrained on expanded DB training setup",
-            "storage_side_dts_pipeline_changed": False,
-        },
-        "counts": {
-            "passages_total": len(passage_ids_all),
-            "base_docs": len(base_ids),
-            "added_docs": len(added_ids),
-            "queries_total_with_qrels": len(query_ids_all),
-            "positive_qrels": int(len(pos_qrels)),
-            "base_train_queries": len(base_train_qids),
-            "base_eval_queries": len(base_eval_qids),
-            "refresh_new_doc_train_queries": len(split["refresh_new_train_qids"]),
-            "expanded_train_queries": len(expanded_train_qids),
-            "expanded_new_doc_eval_queries": len(expanded_eval_qids),
-        },
-        "paths": {
-            "dataset_dir": str(ds_dir),
-            "corpus_file": corpus_file,
-            "queries_file": queries_file,
-            "qrels_file": str(qrels_file),
-            "passage_embedding_cache": embed_path,
-            "query_embedding_cache": qembed_path,
-            "intermediate_dir": inter_dir,
-            "output_dir": out_dir,
-            "summary_long_csv": long_csv,
-            "final_rebuttal_table_csv": final_csv,
-            "final_rebuttal_table_md": final_md,
-            "frozen_preproc": frozen_preproc,
-            "refreshed_preproc": refreshed_preproc,
-        },
-        "adapter_slugs": {
-            "base": base_adapter_slug,
-            "frozen_eval_alias": frozen_eval_slug,
-            "refreshed": None if args.skip_refreshed else refreshed_adapter_slug,
-        },
-        "timing_sec": {
-            "total": time.time() - start,
-        },
-    }
-    meta_json = os.path.join(out_dir, "experiment_meta.json")
-    with open(meta_json, "w", encoding="utf-8") as handle:
-        json.dump(meta, handle, indent=2)
-
-    print("saved:", long_csv, flush=True)
-    print("saved:", final_csv, flush=True)
-    print("saved:", final_md, flush=True)
-    print("saved:", meta_json, flush=True)
+    rt = build_runtime(args)
+    if args.stage == "prep":
+        run_prep(args, rt)
+    elif args.stage == "eval":
+        run_eval(args, rt)
+    elif args.stage == "summarize":
+        summarize_one(args, rt)
+    elif args.stage == "aggregate":
+        run_aggregate(args, rt)
+    else:
+        run_all(args, rt)
 
 
 if __name__ == "__main__":

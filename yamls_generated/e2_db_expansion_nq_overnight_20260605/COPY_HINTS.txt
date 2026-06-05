@@ -1,0 +1,11 @@
+All results land under:
+/mnt/work/VectorDB_MICRO/DBAM/db_expansion_runs_20260605
+
+Primary per-run final tables:
+/mnt/work/VectorDB_MICRO/DBAM/db_expansion_runs_20260605/nq/<encoder_tag>/results/db_expansion/e2_db_expansion_nq_overnight_20260605/np*/**/final_rebuttal_table.csv
+
+Aggregate tables:
+/mnt/work/VectorDB_MICRO/DBAM/db_expansion_runs_20260605/nq/<encoder_tag>/results/db_expansion/e2_db_expansion_nq_overnight_20260605/aggregate/
+
+Generated job count: 50
+GIT_REF used in YAMLs: main
