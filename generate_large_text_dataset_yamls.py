@@ -85,7 +85,27 @@ def affinity():
 """
 
 
-def job_doc(name, labels, args, gpu, cpu, request_memory, limit_memory):
+def init_wait_block(wait_path):
+    if not wait_path:
+        return ""
+    return f"""      initContainers:
+      - name: wait-for-dataset
+        image: busybox:1.36
+        command: ["sh", "-c", "until [ -f {wait_path} ]; do echo waiting for {wait_path}; sleep 60; done"]
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+        volumeMounts:
+          - name: work
+            mountPath: {MOUNT}
+"""
+
+
+def job_doc(name, labels, args, gpu, cpu, request_memory, limit_memory, init_wait_path=None):
     label_lines = "\n".join(f'    {key}: "{value}"' for key, value in labels.items())
     pod_label_lines = "\n".join(f'        {key}: "{value}"' for key, value in labels.items())
     return f"""apiVersion: batch/v1
@@ -103,7 +123,7 @@ spec:
 {pod_label_lines}
     spec:
       restartPolicy: Never
-{affinity()}      containers:
+{affinity()}{init_wait_block(init_wait_path)}      containers:
       - name: run
         image: {IMAGE}
         imagePullPolicy: IfNotPresent
@@ -185,6 +205,7 @@ def embed_job(dataset, ds_cfg, enc_short, enc_cfg):
         4,
         enc_cfg["request_memory"],
         enc_cfg["limit_memory"],
+        init_wait_path=f"{DATA_ROOT}/{dataset}/{dataset}/DATASET_READY.json",
     )
 
 
