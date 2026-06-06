@@ -222,9 +222,11 @@ def main():
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
 
-    ds_dir = resolve_dataset_dir(args.data_root, args.dataset)
-    ready_path = ds_dir / "DATASET_READY.json"
+    expected_ready_path = Path(args.data_root) / args.dataset / args.dataset / "DATASET_READY.json"
+    fallback_ready_path = Path(args.data_root) / args.dataset / "DATASET_READY.json"
+    ready_path = expected_ready_path if expected_ready_path.parent.exists() or not fallback_ready_path.exists() else fallback_ready_path
     wait_for_path(ready_path, args.wait_timeout_sec, args.wait_poll_sec)
+    ds_dir = resolve_dataset_dir(args.data_root, args.dataset)
 
     tag = encoder_tag(args.encoder)
     inter_dir = Path(args.intermediate_root) / args.dataset / tag
