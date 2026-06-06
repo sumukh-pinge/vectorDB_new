@@ -1,0 +1,76 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: vdb-large-miracl-mpnet-embed
+  namespace: designlab
+  labels:
+    app: "vectordb-large-text-prep"
+    dataset: "miracl-en"
+    stage: "embed"
+    encoder: "mpnet"
+spec:
+  backoffLimit: 1
+  template:
+    metadata:
+      labels:
+        app: "vectordb-large-text-prep"
+        dataset: "miracl-en"
+        stage: "embed"
+        encoder: "mpnet"
+    spec:
+      restartPolicy: Never
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - k8s-gpu-2.ucr.edu
+      containers:
+      - name: run
+        image: spinge/vectordb-new:20260304
+        imagePullPolicy: IfNotPresent
+        command: ["/usr/local/bin/nrp-launch"]
+        args:
+          - "bash"
+          - "-lc"
+          - "set -euo pipefail; mkdir -p /mnt/work/VectorDB_MICRO/large_text_prep_logs_20260606; echo '[job] vdb-large-miracl-mpnet-embed' | tee -a /mnt/work/VectorDB_MICRO/large_text_prep_logs_20260606/vdb-large-miracl-mpnet-embed.log; echo '[start]' $(date -u +%Y-%m-%dT%H:%M:%SZ) | tee -a /mnt/work/VectorDB_MICRO/large_text_prep_logs_20260606/vdb-large-miracl-mpnet-embed.log; (python embed_large_text_dataset.py --dataset miracl-en --encoder all-mpnet-base-v2 --data_root /mnt/work/VectorDB_MICRO/datasets/semantic --intermediate_root /mnt/work/VectorDB_MICRO/intermediate_data --expected_docs 32893221 --corpus_batch_size 256 --query_batch_size 512 --query_splits dev,train --wait_timeout_sec 172800 --wait_poll_sec 60) 2>&1 | tee -a /mnt/work/VectorDB_MICRO/large_text_prep_logs_20260606/vdb-large-miracl-mpnet-embed.log; echo '[done]' $(date -u +%Y-%m-%dT%H:%M:%SZ) | tee -a /mnt/work/VectorDB_MICRO/large_text_prep_logs_20260606/vdb-large-miracl-mpnet-embed.log"
+        env:
+          - name: GIT_REPO
+            value: "https://github.com/sumukh-pinge/vectorDB_new.git"
+          - name: GIT_REF
+            value: "main"
+          - name: HF_HOME
+            value: "/mnt/work/hf_cache"
+          - name: HF_DATASETS_CACHE
+            value: "/mnt/work/hf_cache/datasets"
+          - name: TRANSFORMERS_CACHE
+            value: "/mnt/work/hf_cache"
+          - name: IR_DATASETS_HOME
+            value: "/mnt/work/hf_cache/ir_datasets"
+          - name: PIP_CACHE_DIR
+            value: "/mnt/work/hf_cache/pip"
+          - name: DATA_ROOT
+            value: "/mnt/work/VectorDB_MICRO/datasets/semantic"
+          - name: INTERMEDIATE_ROOT
+            value: "/mnt/work/VectorDB_MICRO/intermediate_data"
+          - name: PYTHONUNBUFFERED
+            value: "1"
+        resources:
+          requests:
+            nvidia.com/gpu: 1
+            cpu: "4"
+            memory: "48Gi"
+          limits:
+            nvidia.com/gpu: 1
+            cpu: "4"
+            memory: "64Gi"
+        volumeMounts:
+          - name: work
+            mountPath: /mnt/work
+      volumes:
+        - name: work
+          persistentVolumeClaim:
+            claimName: sumukh-4tb
