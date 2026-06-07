@@ -1,0 +1,108 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: vdb-ls-dpr-w100-minilm-np512-dts111
+  namespace: designlab
+  labels:
+    app: "vectordb-large-scale"
+    dataset: "dpr-w100"
+    encoder: "minilm"
+    stage: "eval"
+    mode: "dts111"
+    nprobe: "np512"
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app: "vectordb-large-scale"
+        dataset: "dpr-w100"
+        encoder: "minilm"
+        stage: "eval"
+        mode: "dts111"
+        nprobe: "np512"
+    spec:
+      restartPolicy: Never
+
+      initContainers:
+      - name: wait-for-marker
+        image: busybox:1.36
+        command: ["sh", "-c", "until [ -f /mnt/work/VectorDB_MICRO/large_scale_indices/large_scale_minilm_20260607/dpr-w100/all-MiniLM-L6-v2/nlist4096/INDEX_READY.json ]; do echo waiting for /mnt/work/VectorDB_MICRO/large_scale_indices/large_scale_minilm_20260607/dpr-w100/all-MiniLM-L6-v2/nlist4096/INDEX_READY.json; sleep 60; done"]
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+        volumeMounts:
+          - name: work
+            mountPath: /mnt/work
+      containers:
+      - name: run
+        image: spinge/vectordb-new:20260304
+        imagePullPolicy: IfNotPresent
+        command: ["/usr/local/bin/nrp-launch"]
+        args:
+          - "python"
+          - "run_large_scale_retrieval.py"
+          - "--stage"
+          - "eval"
+          - "--dataset"
+          - "dpr-w100"
+          - "--encoder"
+          - "all-MiniLM-L6-v2"
+          - "--mode"
+          - "dts111"
+          - "--nlist"
+          - "4096"
+          - "--nprobe"
+          - "512"
+          - "--k2"
+          - "1000"
+          - "--kfinal"
+          - "100"
+          - "--faiss_threads"
+          - "4"
+          - "--score_chunk_size"
+          - "250000"
+        env:
+          - name: GIT_REPO
+            value: "https://github.com/sumukh-pinge/vectorDB_new.git"
+          - name: GIT_REF
+            value: "main"
+          - name: HF_HOME
+            value: "/mnt/work/hf_cache"
+          - name: TRANSFORMERS_CACHE
+            value: "/mnt/work/hf_cache"
+          - name: DATA_ROOT
+            value: "/mnt/work/VectorDB_MICRO/datasets/semantic"
+          - name: INTERMEDIATE_ROOT
+            value: "/mnt/work/VectorDB_MICRO/intermediate_data"
+          - name: INDEX_ROOT
+            value: "/mnt/work/VectorDB_MICRO/large_scale_indices/large_scale_minilm_20260607"
+          - name: RUN_ROOT
+            value: "/mnt/work/VectorDB_MICRO/large_scale_runs/large_scale_minilm_20260607"
+          - name: PYTHONUNBUFFERED
+            value: "1"
+          - name: OMP_NUM_THREADS
+            value: "4"
+          - name: MKL_NUM_THREADS
+            value: "4"
+        resources:
+          requests:
+            nvidia.com/gpu: 0
+            cpu: "4"
+            memory: "384Gi"
+          limits:
+            nvidia.com/gpu: 0
+            cpu: "4"
+            memory: "448Gi"
+        volumeMounts:
+          - name: work
+            mountPath: /mnt/work
+      volumes:
+        - name: work
+          persistentVolumeClaim:
+            claimName: sumukh-4tb
