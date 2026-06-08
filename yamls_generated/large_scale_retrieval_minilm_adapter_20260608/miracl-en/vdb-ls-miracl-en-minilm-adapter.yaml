@@ -93,11 +93,11 @@ spec:
         resources:
           requests:
             nvidia.com/gpu: 0
-            cpu: "2"
+            cpu: "1"
             memory: "32Gi"
           limits:
             nvidia.com/gpu: 0
-            cpu: "2"
+            cpu: "1"
             memory: "64Gi"
         volumeMounts:
           - name: work

@@ -39,7 +39,7 @@ spec:
           - "--nlist"
           - "8192"
           - "--faiss_threads"
-          - "4"
+          - "1"
           - "--train_size"
           - "400000"
           - "--train_blocks"
@@ -70,11 +70,11 @@ spec:
         resources:
           requests:
             nvidia.com/gpu: 0
-            cpu: "4"
+            cpu: "1"
             memory: "512Gi"
           limits:
             nvidia.com/gpu: 0
-            cpu: "4"
+            cpu: "1"
             memory: "640Gi"
         volumeMounts:
           - name: work

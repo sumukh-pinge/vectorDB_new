@@ -41,7 +41,7 @@ DATASETS = {
         "index_mem": ("384Gi", "448Gi"),
         "eval_mem": ("384Gi", "448Gi"),
         "adapter_mem": ("32Gi", "64Gi"),
-        "adapter_cpu": "2",
+        "adapter_cpu": "1",
         "agg_mem": ("8Gi", "16Gi"),
     },
     "miracl-en": {
@@ -53,7 +53,7 @@ DATASETS = {
         "index_mem": ("512Gi", "640Gi"),
         "eval_mem": ("512Gi", "640Gi"),
         "adapter_mem": ("32Gi", "64Gi"),
-        "adapter_cpu": "2",
+        "adapter_cpu": "1",
         "agg_mem": ("8Gi", "16Gi"),
     },
 }
@@ -203,7 +203,7 @@ def main():
             "--encoder", ENCODER,
             "--qrels_split", cfg["qrels_split"],
             "--nlist", str(nlist),
-            "--faiss_threads", "4",
+            "--faiss_threads", "1",
             "--train_size", "400000",
             "--train_blocks", "128",
         ]
@@ -212,7 +212,7 @@ def main():
             {"app": "vectordb-large-scale", "dataset": dataset, "encoder": ENCODER_SHORT, "stage": "index"},
             idx_args,
             *cfg["index_mem"],
-            cpu="4",
+            cpu="1",
         )
         idx_path = ds_dir / f"{idx_name}.yaml"
         idx_path.write_text(idx_doc)
