@@ -25,10 +25,11 @@ DATASETS = {
         "nprobes": [64, 128],
         "qrels_split": "test",
         "adapter_train_split": "test",
-        "adapter_source_slug": "adapter_nl1024_b4_nq_all-MiniLM-L6-v2",
+        "adapter_source_slug": "",
         "index_mem": ("56Gi", "64Gi"),
         "eval_mem": ("56Gi", "64Gi"),
         "adapter_mem": ("16Gi", "32Gi"),
+        "adapter_cpu": "1",
         "agg_mem": ("4Gi", "8Gi"),
     },
     "dpr-w100": {
@@ -40,6 +41,7 @@ DATASETS = {
         "index_mem": ("384Gi", "448Gi"),
         "eval_mem": ("384Gi", "448Gi"),
         "adapter_mem": ("32Gi", "64Gi"),
+        "adapter_cpu": "2",
         "agg_mem": ("8Gi", "16Gi"),
     },
     "miracl-en": {
@@ -51,6 +53,7 @@ DATASETS = {
         "index_mem": ("512Gi", "640Gi"),
         "eval_mem": ("512Gi", "640Gi"),
         "adapter_mem": ("32Gi", "64Gi"),
+        "adapter_cpu": "2",
         "agg_mem": ("8Gi", "16Gi"),
     },
 }
@@ -240,7 +243,7 @@ def main():
             {"app": "vectordb-large-scale", "dataset": dataset, "encoder": ENCODER_SHORT, "stage": "adapter"},
             adapt_args,
             *cfg["adapter_mem"],
-            cpu="2",
+            cpu=cfg.get("adapter_cpu", "2"),
             init_paths=[index_marker(dataset, nlist)] if not cfg["adapter_source_slug"] else [],
         )
         adapt_path = ds_dir / f"{adapt_name}.yaml"
