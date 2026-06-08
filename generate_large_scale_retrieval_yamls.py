@@ -160,6 +160,8 @@ def main():
             "--encoder", ENCODER,
             "--nlist", str(nlist),
             "--faiss_threads", "4",
+            "--train_size", "400000",
+            "--train_blocks", "128",
         ]
         doc = job_doc(
             idx_name,

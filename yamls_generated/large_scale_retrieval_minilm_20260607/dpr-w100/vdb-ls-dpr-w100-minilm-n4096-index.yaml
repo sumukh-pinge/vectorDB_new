@@ -38,6 +38,10 @@ spec:
           - "4096"
           - "--faiss_threads"
           - "4"
+          - "--train_size"
+          - "400000"
+          - "--train_blocks"
+          - "128"
         env:
           - name: GIT_REPO
             value: "https://github.com/sumukh-pinge/vectorDB_new.git"

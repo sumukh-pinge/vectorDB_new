@@ -149,6 +149,33 @@ def quantize_chunk(x, vmin, vmax):
     return np.clip(np.rint(y), 0, LEVELS - 1).astype(np.uint8)
 
 
+def load_train_sample(embeddings, n_docs, dim, train_n, seed, blocks=64):
+    train = np.empty((train_n, dim), dtype=np.float32)
+    if train_n == n_docs:
+        train[:] = np.asarray(embeddings, dtype=np.float32)
+        return train
+
+    rng = np.random.default_rng(seed)
+    blocks = max(1, min(blocks, train_n))
+    base = train_n // blocks
+    extra = train_n % blocks
+    max_block = base + (1 if extra else 0)
+    max_start = max(0, n_docs - max_block)
+    anchors = np.linspace(0, max_start, blocks, dtype=np.int64)
+    jitter_width = max(1, n_docs // (blocks * 4))
+    pos = 0
+    for block_idx, anchor in enumerate(anchors):
+        take = base + (1 if block_idx < extra else 0)
+        if take <= 0:
+            continue
+        jitter = int(rng.integers(-jitter_width, jitter_width + 1))
+        start = int(np.clip(anchor + jitter, 0, n_docs - take))
+        end = start + take
+        train[pos:pos + take] = np.asarray(embeddings[start:end], dtype=np.float32)
+        pos += take
+    return train
+
+
 def dbam_dual_scores(q_code, base_q, alpha, m):
     dim = q_code.size
     group_count = dim // m
@@ -235,10 +262,10 @@ def build_index(args):
     n_docs, dim = embeddings.shape
     print(f"[index] embeddings={embeddings.shape} nlist={args.nlist}", flush=True)
 
-    rng = np.random.default_rng(args.seed)
     train_n = min(args.train_size, n_docs)
-    train_ids = rng.choice(n_docs, size=train_n, replace=False)
-    train = np.asarray(embeddings[train_ids], dtype=np.float32)
+    t_sample = time.time()
+    train = load_train_sample(embeddings, n_docs, dim, train_n, args.seed, args.train_blocks)
+    print(f"[index] train_sample_n={train_n} train_sample_s={time.time() - t_sample:.1f}", flush=True)
 
     quantizer = faiss.IndexFlatL2(dim)
     index = faiss.IndexIVFFlat(quantizer, dim, args.nlist, faiss.METRIC_L2)
@@ -472,6 +499,7 @@ def main():
     parser.add_argument("--kfinal", type=int, default=100)
     parser.add_argument("--faiss_threads", type=int, default=4)
     parser.add_argument("--train_size", type=int, default=1000000)
+    parser.add_argument("--train_blocks", type=int, default=64)
     parser.add_argument("--add_batch_size", type=int, default=100000)
     parser.add_argument("--quant_batch_size", type=int, default=200000)
     parser.add_argument("--score_chunk_size", type=int, default=250000)
