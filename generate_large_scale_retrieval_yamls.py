@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from pathlib import Path
 import os
+import shutil
 
 
 NAMESPACE = "designlab"
@@ -176,11 +177,12 @@ def summary_marker(dataset, nlist, nprobe, mode, adapter):
 
 def main():
     outroot = Path("yamls_generated/large_scale_retrieval_minilm_adapter_20260608")
+    if outroot.exists():
+        shutil.rmtree(outroot)
     outroot.mkdir(parents=True, exist_ok=True)
     docs = []
     scripts = {
-        "apply_index.sh": ["#!/usr/bin/env bash", "set -euo pipefail"],
-        "apply_adapter.sh": ["#!/usr/bin/env bash", "set -euo pipefail"],
+        "apply_prep.sh": ["#!/usr/bin/env bash", "set -euo pipefail"],
         "apply_eval_no_adapter.sh": ["#!/usr/bin/env bash", "set -euo pipefail"],
         "apply_eval_adapter.sh": ["#!/usr/bin/env bash", "set -euo pipefail"],
         "apply_eval.sh": ["#!/usr/bin/env bash", "set -euo pipefail"],
@@ -195,10 +197,10 @@ def main():
         nlist = cfg["nlist"]
         slug = adapter_slug(dataset, nlist)
 
-        idx_name = f"vdb-ls-{ds_safe}-{ENCODER_SHORT}-n{nlist}-index"[:63]
-        idx_args = [
+        prep_name = f"vdb-ls-{ds_safe}-{ENCODER_SHORT}-n{nlist}-prep"[:63]
+        prep_args = [
             "python", "run_large_scale_retrieval.py",
-            "--stage", "build-index",
+            "--stage", "prep",
             "--dataset", dataset,
             "--encoder", ENCODER,
             "--qrels_split", cfg["qrels_split"],
@@ -207,50 +209,29 @@ def main():
             "--train_size", "400000",
             "--train_blocks", "128",
         ]
-        idx_doc = job_doc(
-            idx_name,
-            {"app": "vectordb-large-scale", "dataset": dataset, "encoder": ENCODER_SHORT, "stage": "index"},
-            idx_args,
-            *cfg["index_mem"],
-            cpu="1",
-        )
-        idx_path = ds_dir / f"{idx_name}.yaml"
-        idx_path.write_text(idx_doc)
-        docs.append(idx_doc)
-        scripts["apply_index.sh"].append(f"kubectl apply -f {ds_safe}/{idx_path.name}")
-        scripts["delete_all.sh"].append(f"kubectl delete -f {ds_safe}/{idx_path.name} || true")
-
-        adapt_name = f"vdb-ls-{ds_safe}-{ENCODER_SHORT}-adapter"[:63]
-        adapt_args = [
-            "python", "run_large_scale_retrieval.py",
-            "--stage", "train-adapter",
-            "--dataset", dataset,
-            "--encoder", ENCODER,
-            "--qrels_split", cfg["qrels_split"],
+        prep_args.extend([
             "--adapter_train_split", cfg["adapter_train_split"],
-            "--nlist", str(nlist),
             "--adapter_slug", slug,
             "--adapter_epochs", "1",
             "--adapter_max_pairs", "100000",
             "--adapter_negatives", "4096",
             "--adapter_qbatch", "256",
             "--adapter_device", "cpu",
-        ]
+        ])
         if cfg["adapter_source_slug"]:
-            adapt_args.extend(["--adapter_source_slug", cfg["adapter_source_slug"]])
-        adapt_doc = job_doc(
-            adapt_name,
-            {"app": "vectordb-large-scale", "dataset": dataset, "encoder": ENCODER_SHORT, "stage": "adapter"},
-            adapt_args,
-            *cfg["adapter_mem"],
-            cpu=cfg.get("adapter_cpu", "2"),
-            init_paths=[index_marker(dataset, nlist)] if not cfg["adapter_source_slug"] else [],
+            prep_args.extend(["--adapter_source_slug", cfg["adapter_source_slug"]])
+        prep_doc = job_doc(
+            prep_name,
+            {"app": "vectordb-large-scale", "dataset": dataset, "encoder": ENCODER_SHORT, "stage": "prep"},
+            prep_args,
+            *cfg["index_mem"],
+            cpu="1",
         )
-        adapt_path = ds_dir / f"{adapt_name}.yaml"
-        adapt_path.write_text(adapt_doc)
-        docs.append(adapt_doc)
-        scripts["apply_adapter.sh"].append(f"kubectl apply -f {ds_safe}/{adapt_path.name}")
-        scripts["delete_all.sh"].append(f"kubectl delete -f {ds_safe}/{adapt_path.name} || true")
+        prep_path = ds_dir / f"{prep_name}.yaml"
+        prep_path.write_text(prep_doc)
+        docs.append(prep_doc)
+        scripts["apply_prep.sh"].append(f"kubectl apply -f {ds_safe}/{prep_path.name}")
+        scripts["delete_all.sh"].append(f"kubectl delete -f {ds_safe}/{prep_path.name} || true")
 
         for nprobe in cfg["nprobes"]:
             for mode in MODES:
@@ -331,7 +312,7 @@ def main():
         os.chmod(path, 0o755)
     (outroot / "README.txt").write_text(
         "MiniLM adapter/no-adapter retrieval jobs.\n"
-        "Order: apply_index.sh, apply_adapter.sh, apply_eval.sh, apply_aggregate.sh.\n"
+        "Order: apply_prep.sh, apply_eval.sh, apply_aggregate.sh.\n"
         "Eval jobs wait on INDEX_READY and adapter-on jobs also wait on ADAPTER_READY.\n"
         "Do not apply until code is pushed to the GIT_REF used by the YAMLs.\n"
     )

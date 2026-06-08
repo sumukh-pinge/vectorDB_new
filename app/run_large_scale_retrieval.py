@@ -719,7 +719,7 @@ def eval_retrieval(args):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--stage", choices=["build-index", "train-adapter", "eval"], required=True)
+    parser.add_argument("--stage", choices=["build-index", "train-adapter", "prep", "eval"], required=True)
     parser.add_argument("--dataset", required=True)
     parser.add_argument("--encoder", required=True)
     parser.add_argument("--mode", choices=["ivf", "dts111", "dts242"], default="ivf")
@@ -766,6 +766,12 @@ def main():
         build_index(args)
     elif args.stage == "train-adapter":
         train_adapter(args)
+    elif args.stage == "prep":
+        print("[stage=prep] start index_then_adapter", flush=True)
+        build_index(args)
+        print("[stage=prep] index phase complete; starting adapter phase", flush=True)
+        train_adapter(args)
+        print("[stage=prep] complete INDEX_READY and ADAPTER_READY", flush=True)
     else:
         eval_retrieval(args)
 

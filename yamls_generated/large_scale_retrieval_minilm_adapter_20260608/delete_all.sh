@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-kubectl delete -f nq/vdb-ls-nq-minilm-n1024-index.yaml || true
-kubectl delete -f nq/vdb-ls-nq-minilm-adapter.yaml || true
+kubectl delete -f nq/vdb-ls-nq-minilm-n1024-prep.yaml || true
 kubectl delete -f nq/vdb-ls-nq-minilm-np64-ivf-aoff.yaml || true
 kubectl delete -f nq/vdb-ls-nq-minilm-np64-ivf-aon.yaml || true
 kubectl delete -f nq/vdb-ls-nq-minilm-np64-dts111-aoff.yaml || true
@@ -15,8 +14,7 @@ kubectl delete -f nq/vdb-ls-nq-minilm-np128-dts111-aon.yaml || true
 kubectl delete -f nq/vdb-ls-nq-minilm-np128-dts242-aoff.yaml || true
 kubectl delete -f nq/vdb-ls-nq-minilm-np128-dts242-aon.yaml || true
 kubectl delete -f nq/vdb-ls-nq-minilm-aggregate.yaml || true
-kubectl delete -f dpr-w100/vdb-ls-dpr-w100-minilm-n4096-index.yaml || true
-kubectl delete -f dpr-w100/vdb-ls-dpr-w100-minilm-adapter.yaml || true
+kubectl delete -f dpr-w100/vdb-ls-dpr-w100-minilm-n4096-prep.yaml || true
 kubectl delete -f dpr-w100/vdb-ls-dpr-w100-minilm-np128-ivf-aoff.yaml || true
 kubectl delete -f dpr-w100/vdb-ls-dpr-w100-minilm-np128-ivf-aon.yaml || true
 kubectl delete -f dpr-w100/vdb-ls-dpr-w100-minilm-np128-dts111-aoff.yaml || true
@@ -36,8 +34,7 @@ kubectl delete -f dpr-w100/vdb-ls-dpr-w100-minilm-np512-dts111-aon.yaml || true
 kubectl delete -f dpr-w100/vdb-ls-dpr-w100-minilm-np512-dts242-aoff.yaml || true
 kubectl delete -f dpr-w100/vdb-ls-dpr-w100-minilm-np512-dts242-aon.yaml || true
 kubectl delete -f dpr-w100/vdb-ls-dpr-w100-minilm-aggregate.yaml || true
-kubectl delete -f miracl-en/vdb-ls-miracl-en-minilm-n8192-index.yaml || true
-kubectl delete -f miracl-en/vdb-ls-miracl-en-minilm-adapter.yaml || true
+kubectl delete -f miracl-en/vdb-ls-miracl-en-minilm-n8192-prep.yaml || true
 kubectl delete -f miracl-en/vdb-ls-miracl-en-minilm-np128-ivf-aoff.yaml || true
 kubectl delete -f miracl-en/vdb-ls-miracl-en-minilm-np128-ivf-aon.yaml || true
 kubectl delete -f miracl-en/vdb-ls-miracl-en-minilm-np128-dts111-aoff.yaml || true

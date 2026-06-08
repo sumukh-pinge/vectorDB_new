@@ -1,13 +1,13 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: vdb-ls-miracl-en-minilm-n8192-index
+  name: vdb-ls-miracl-en-minilm-n8192-prep
   namespace: designlab
   labels:
     app: "vectordb-large-scale"
     dataset: "miracl-en"
     encoder: "minilm"
-    stage: "index"
+    stage: "prep"
 spec:
   backoffLimit: 3
   ttlSecondsAfterFinished: 86400
@@ -17,7 +17,7 @@ spec:
         app: "vectordb-large-scale"
         dataset: "miracl-en"
         encoder: "minilm"
-        stage: "index"
+        stage: "prep"
     spec:
       restartPolicy: Never
       containers:
@@ -29,7 +29,7 @@ spec:
           - "python"
           - "run_large_scale_retrieval.py"
           - "--stage"
-          - "build-index"
+          - "prep"
           - "--dataset"
           - "miracl-en"
           - "--encoder"
@@ -44,6 +44,20 @@ spec:
           - "400000"
           - "--train_blocks"
           - "128"
+          - "--adapter_train_split"
+          - "train"
+          - "--adapter_slug"
+          - "large_scale_adapter_miracl-en_all-MiniLM-L6-v2_nlist8192"
+          - "--adapter_epochs"
+          - "1"
+          - "--adapter_max_pairs"
+          - "100000"
+          - "--adapter_negatives"
+          - "4096"
+          - "--adapter_qbatch"
+          - "256"
+          - "--adapter_device"
+          - "cpu"
         env:
           - name: GIT_REPO
             value: "https://github.com/sumukh-pinge/vectorDB_new.git"

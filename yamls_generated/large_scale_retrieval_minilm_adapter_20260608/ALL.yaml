@@ -1,13 +1,13 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: vdb-ls-nq-minilm-n1024-index
+  name: vdb-ls-nq-minilm-n1024-prep
   namespace: designlab
   labels:
     app: "vectordb-large-scale"
     dataset: "nq"
     encoder: "minilm"
-    stage: "index"
+    stage: "prep"
 spec:
   backoffLimit: 3
   ttlSecondsAfterFinished: 86400
@@ -17,7 +17,7 @@ spec:
         app: "vectordb-large-scale"
         dataset: "nq"
         encoder: "minilm"
-        stage: "index"
+        stage: "prep"
     spec:
       restartPolicy: Never
       containers:
@@ -29,7 +29,7 @@ spec:
           - "python"
           - "run_large_scale_retrieval.py"
           - "--stage"
-          - "build-index"
+          - "prep"
           - "--dataset"
           - "nq"
           - "--encoder"
@@ -44,103 +44,8 @@ spec:
           - "400000"
           - "--train_blocks"
           - "128"
-        env:
-          - name: GIT_REPO
-            value: "https://github.com/sumukh-pinge/vectorDB_new.git"
-          - name: GIT_REF
-            value: "main"
-          - name: HF_HOME
-            value: "/mnt/work/hf_cache"
-          - name: TRANSFORMERS_CACHE
-            value: "/mnt/work/hf_cache"
-          - name: DATA_ROOT
-            value: "/mnt/work/VectorDB_MICRO/datasets/semantic"
-          - name: INTERMEDIATE_ROOT
-            value: "/mnt/work/VectorDB_MICRO/intermediate_data"
-          - name: INDEX_ROOT
-            value: "/mnt/work/VectorDB_MICRO/large_scale_indices/large_scale_minilm_adapter_20260608"
-          - name: RUN_ROOT
-            value: "/mnt/work/VectorDB_MICRO/large_scale_runs/large_scale_minilm_adapter_20260608"
-          - name: PYTHONUNBUFFERED
-            value: "1"
-          - name: OMP_NUM_THREADS
-            value: "1"
-          - name: MKL_NUM_THREADS
-            value: "1"
-        resources:
-          requests:
-            nvidia.com/gpu: 0
-            cpu: "1"
-            memory: "56Gi"
-          limits:
-            nvidia.com/gpu: 0
-            cpu: "1"
-            memory: "64Gi"
-        volumeMounts:
-          - name: work
-            mountPath: /mnt/work
-      volumes:
-        - name: work
-          persistentVolumeClaim:
-            claimName: sumukh-4tb
----
-apiVersion: batch/v1
-kind: Job
-metadata:
-  name: vdb-ls-nq-minilm-adapter
-  namespace: designlab
-  labels:
-    app: "vectordb-large-scale"
-    dataset: "nq"
-    encoder: "minilm"
-    stage: "adapter"
-spec:
-  backoffLimit: 3
-  ttlSecondsAfterFinished: 86400
-  template:
-    metadata:
-      labels:
-        app: "vectordb-large-scale"
-        dataset: "nq"
-        encoder: "minilm"
-        stage: "adapter"
-    spec:
-      restartPolicy: Never
-
-      initContainers:
-      - name: wait-for-markers
-        image: busybox:1.36
-        command: ["sh", "-c", "until [ -f /mnt/work/VectorDB_MICRO/large_scale_indices/large_scale_minilm_adapter_20260608/nq/all-MiniLM-L6-v2/nlist1024/INDEX_READY.json ]; do echo waiting for /mnt/work/VectorDB_MICRO/large_scale_indices/large_scale_minilm_adapter_20260608/nq/all-MiniLM-L6-v2/nlist1024/INDEX_READY.json; sleep 60; done"]
-        resources:
-          requests:
-            cpu: "100m"
-            memory: "128Mi"
-          limits:
-            cpu: "500m"
-            memory: "512Mi"
-        volumeMounts:
-          - name: work
-            mountPath: /mnt/work
-      containers:
-      - name: run
-        image: spinge/vectordb-new:20260304
-        imagePullPolicy: IfNotPresent
-        command: ["/usr/local/bin/nrp-launch"]
-        args:
-          - "python"
-          - "run_large_scale_retrieval.py"
-          - "--stage"
-          - "train-adapter"
-          - "--dataset"
-          - "nq"
-          - "--encoder"
-          - "all-MiniLM-L6-v2"
-          - "--qrels_split"
-          - "test"
           - "--adapter_train_split"
           - "test"
-          - "--nlist"
-          - "1024"
           - "--adapter_slug"
           - "large_scale_adapter_nq_all-MiniLM-L6-v2_nlist1024"
           - "--adapter_epochs"
@@ -180,11 +85,11 @@ spec:
           requests:
             nvidia.com/gpu: 0
             cpu: "1"
-            memory: "16Gi"
+            memory: "56Gi"
           limits:
             nvidia.com/gpu: 0
             cpu: "1"
-            memory: "32Gi"
+            memory: "64Gi"
         volumeMounts:
           - name: work
             mountPath: /mnt/work
@@ -1697,13 +1602,13 @@ spec:
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: vdb-ls-dpr-w100-minilm-n4096-index
+  name: vdb-ls-dpr-w100-minilm-n4096-prep
   namespace: designlab
   labels:
     app: "vectordb-large-scale"
     dataset: "dpr-w100"
     encoder: "minilm"
-    stage: "index"
+    stage: "prep"
 spec:
   backoffLimit: 3
   ttlSecondsAfterFinished: 86400
@@ -1713,7 +1618,7 @@ spec:
         app: "vectordb-large-scale"
         dataset: "dpr-w100"
         encoder: "minilm"
-        stage: "index"
+        stage: "prep"
     spec:
       restartPolicy: Never
       containers:
@@ -1725,7 +1630,7 @@ spec:
           - "python"
           - "run_large_scale_retrieval.py"
           - "--stage"
-          - "build-index"
+          - "prep"
           - "--dataset"
           - "dpr-w100"
           - "--encoder"
@@ -1740,103 +1645,8 @@ spec:
           - "400000"
           - "--train_blocks"
           - "128"
-        env:
-          - name: GIT_REPO
-            value: "https://github.com/sumukh-pinge/vectorDB_new.git"
-          - name: GIT_REF
-            value: "main"
-          - name: HF_HOME
-            value: "/mnt/work/hf_cache"
-          - name: TRANSFORMERS_CACHE
-            value: "/mnt/work/hf_cache"
-          - name: DATA_ROOT
-            value: "/mnt/work/VectorDB_MICRO/datasets/semantic"
-          - name: INTERMEDIATE_ROOT
-            value: "/mnt/work/VectorDB_MICRO/intermediate_data"
-          - name: INDEX_ROOT
-            value: "/mnt/work/VectorDB_MICRO/large_scale_indices/large_scale_minilm_adapter_20260608"
-          - name: RUN_ROOT
-            value: "/mnt/work/VectorDB_MICRO/large_scale_runs/large_scale_minilm_adapter_20260608"
-          - name: PYTHONUNBUFFERED
-            value: "1"
-          - name: OMP_NUM_THREADS
-            value: "1"
-          - name: MKL_NUM_THREADS
-            value: "1"
-        resources:
-          requests:
-            nvidia.com/gpu: 0
-            cpu: "1"
-            memory: "384Gi"
-          limits:
-            nvidia.com/gpu: 0
-            cpu: "1"
-            memory: "448Gi"
-        volumeMounts:
-          - name: work
-            mountPath: /mnt/work
-      volumes:
-        - name: work
-          persistentVolumeClaim:
-            claimName: sumukh-4tb
----
-apiVersion: batch/v1
-kind: Job
-metadata:
-  name: vdb-ls-dpr-w100-minilm-adapter
-  namespace: designlab
-  labels:
-    app: "vectordb-large-scale"
-    dataset: "dpr-w100"
-    encoder: "minilm"
-    stage: "adapter"
-spec:
-  backoffLimit: 3
-  ttlSecondsAfterFinished: 86400
-  template:
-    metadata:
-      labels:
-        app: "vectordb-large-scale"
-        dataset: "dpr-w100"
-        encoder: "minilm"
-        stage: "adapter"
-    spec:
-      restartPolicy: Never
-
-      initContainers:
-      - name: wait-for-markers
-        image: busybox:1.36
-        command: ["sh", "-c", "until [ -f /mnt/work/VectorDB_MICRO/large_scale_indices/large_scale_minilm_adapter_20260608/dpr-w100/all-MiniLM-L6-v2/nlist4096/INDEX_READY.json ]; do echo waiting for /mnt/work/VectorDB_MICRO/large_scale_indices/large_scale_minilm_adapter_20260608/dpr-w100/all-MiniLM-L6-v2/nlist4096/INDEX_READY.json; sleep 60; done"]
-        resources:
-          requests:
-            cpu: "100m"
-            memory: "128Mi"
-          limits:
-            cpu: "500m"
-            memory: "512Mi"
-        volumeMounts:
-          - name: work
-            mountPath: /mnt/work
-      containers:
-      - name: run
-        image: spinge/vectordb-new:20260304
-        imagePullPolicy: IfNotPresent
-        command: ["/usr/local/bin/nrp-launch"]
-        args:
-          - "python"
-          - "run_large_scale_retrieval.py"
-          - "--stage"
-          - "train-adapter"
-          - "--dataset"
-          - "dpr-w100"
-          - "--encoder"
-          - "all-MiniLM-L6-v2"
-          - "--qrels_split"
-          - "dev"
           - "--adapter_train_split"
           - "train"
-          - "--nlist"
-          - "4096"
           - "--adapter_slug"
           - "large_scale_adapter_dpr-w100_all-MiniLM-L6-v2_nlist4096"
           - "--adapter_epochs"
@@ -1876,11 +1686,11 @@ spec:
           requests:
             nvidia.com/gpu: 0
             cpu: "1"
-            memory: "32Gi"
+            memory: "384Gi"
           limits:
             nvidia.com/gpu: 0
             cpu: "1"
-            memory: "64Gi"
+            memory: "448Gi"
         volumeMounts:
           - name: work
             mountPath: /mnt/work
@@ -4095,13 +3905,13 @@ spec:
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: vdb-ls-miracl-en-minilm-n8192-index
+  name: vdb-ls-miracl-en-minilm-n8192-prep
   namespace: designlab
   labels:
     app: "vectordb-large-scale"
     dataset: "miracl-en"
     encoder: "minilm"
-    stage: "index"
+    stage: "prep"
 spec:
   backoffLimit: 3
   ttlSecondsAfterFinished: 86400
@@ -4111,7 +3921,7 @@ spec:
         app: "vectordb-large-scale"
         dataset: "miracl-en"
         encoder: "minilm"
-        stage: "index"
+        stage: "prep"
     spec:
       restartPolicy: Never
       containers:
@@ -4123,7 +3933,7 @@ spec:
           - "python"
           - "run_large_scale_retrieval.py"
           - "--stage"
-          - "build-index"
+          - "prep"
           - "--dataset"
           - "miracl-en"
           - "--encoder"
@@ -4138,103 +3948,8 @@ spec:
           - "400000"
           - "--train_blocks"
           - "128"
-        env:
-          - name: GIT_REPO
-            value: "https://github.com/sumukh-pinge/vectorDB_new.git"
-          - name: GIT_REF
-            value: "main"
-          - name: HF_HOME
-            value: "/mnt/work/hf_cache"
-          - name: TRANSFORMERS_CACHE
-            value: "/mnt/work/hf_cache"
-          - name: DATA_ROOT
-            value: "/mnt/work/VectorDB_MICRO/datasets/semantic"
-          - name: INTERMEDIATE_ROOT
-            value: "/mnt/work/VectorDB_MICRO/intermediate_data"
-          - name: INDEX_ROOT
-            value: "/mnt/work/VectorDB_MICRO/large_scale_indices/large_scale_minilm_adapter_20260608"
-          - name: RUN_ROOT
-            value: "/mnt/work/VectorDB_MICRO/large_scale_runs/large_scale_minilm_adapter_20260608"
-          - name: PYTHONUNBUFFERED
-            value: "1"
-          - name: OMP_NUM_THREADS
-            value: "1"
-          - name: MKL_NUM_THREADS
-            value: "1"
-        resources:
-          requests:
-            nvidia.com/gpu: 0
-            cpu: "1"
-            memory: "512Gi"
-          limits:
-            nvidia.com/gpu: 0
-            cpu: "1"
-            memory: "640Gi"
-        volumeMounts:
-          - name: work
-            mountPath: /mnt/work
-      volumes:
-        - name: work
-          persistentVolumeClaim:
-            claimName: sumukh-4tb
----
-apiVersion: batch/v1
-kind: Job
-metadata:
-  name: vdb-ls-miracl-en-minilm-adapter
-  namespace: designlab
-  labels:
-    app: "vectordb-large-scale"
-    dataset: "miracl-en"
-    encoder: "minilm"
-    stage: "adapter"
-spec:
-  backoffLimit: 3
-  ttlSecondsAfterFinished: 86400
-  template:
-    metadata:
-      labels:
-        app: "vectordb-large-scale"
-        dataset: "miracl-en"
-        encoder: "minilm"
-        stage: "adapter"
-    spec:
-      restartPolicy: Never
-
-      initContainers:
-      - name: wait-for-markers
-        image: busybox:1.36
-        command: ["sh", "-c", "until [ -f /mnt/work/VectorDB_MICRO/large_scale_indices/large_scale_minilm_adapter_20260608/miracl-en/all-MiniLM-L6-v2/nlist8192/INDEX_READY.json ]; do echo waiting for /mnt/work/VectorDB_MICRO/large_scale_indices/large_scale_minilm_adapter_20260608/miracl-en/all-MiniLM-L6-v2/nlist8192/INDEX_READY.json; sleep 60; done"]
-        resources:
-          requests:
-            cpu: "100m"
-            memory: "128Mi"
-          limits:
-            cpu: "500m"
-            memory: "512Mi"
-        volumeMounts:
-          - name: work
-            mountPath: /mnt/work
-      containers:
-      - name: run
-        image: spinge/vectordb-new:20260304
-        imagePullPolicy: IfNotPresent
-        command: ["/usr/local/bin/nrp-launch"]
-        args:
-          - "python"
-          - "run_large_scale_retrieval.py"
-          - "--stage"
-          - "train-adapter"
-          - "--dataset"
-          - "miracl-en"
-          - "--encoder"
-          - "all-MiniLM-L6-v2"
-          - "--qrels_split"
-          - "dev"
           - "--adapter_train_split"
           - "train"
-          - "--nlist"
-          - "8192"
           - "--adapter_slug"
           - "large_scale_adapter_miracl-en_all-MiniLM-L6-v2_nlist8192"
           - "--adapter_epochs"
@@ -4274,11 +3989,11 @@ spec:
           requests:
             nvidia.com/gpu: 0
             cpu: "1"
-            memory: "32Gi"
+            memory: "512Gi"
           limits:
             nvidia.com/gpu: 0
             cpu: "1"
-            memory: "64Gi"
+            memory: "640Gi"
         volumeMounts:
           - name: work
             mountPath: /mnt/work

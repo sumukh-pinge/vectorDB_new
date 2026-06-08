@@ -1,13 +1,13 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: vdb-ls-dpr-w100-minilm-adapter
+  name: vdb-ls-dpr-w100-minilm-n4096-prep
   namespace: designlab
   labels:
     app: "vectordb-large-scale"
     dataset: "dpr-w100"
     encoder: "minilm"
-    stage: "adapter"
+    stage: "prep"
 spec:
   backoffLimit: 3
   ttlSecondsAfterFinished: 86400
@@ -17,24 +17,9 @@ spec:
         app: "vectordb-large-scale"
         dataset: "dpr-w100"
         encoder: "minilm"
-        stage: "adapter"
+        stage: "prep"
     spec:
       restartPolicy: Never
-
-      initContainers:
-      - name: wait-for-markers
-        image: busybox:1.36
-        command: ["sh", "-c", "until [ -f /mnt/work/VectorDB_MICRO/large_scale_indices/large_scale_minilm_adapter_20260608/dpr-w100/all-MiniLM-L6-v2/nlist4096/INDEX_READY.json ]; do echo waiting for /mnt/work/VectorDB_MICRO/large_scale_indices/large_scale_minilm_adapter_20260608/dpr-w100/all-MiniLM-L6-v2/nlist4096/INDEX_READY.json; sleep 60; done"]
-        resources:
-          requests:
-            cpu: "100m"
-            memory: "128Mi"
-          limits:
-            cpu: "500m"
-            memory: "512Mi"
-        volumeMounts:
-          - name: work
-            mountPath: /mnt/work
       containers:
       - name: run
         image: spinge/vectordb-new:20260304
@@ -44,17 +29,23 @@ spec:
           - "python"
           - "run_large_scale_retrieval.py"
           - "--stage"
-          - "train-adapter"
+          - "prep"
           - "--dataset"
           - "dpr-w100"
           - "--encoder"
           - "all-MiniLM-L6-v2"
           - "--qrels_split"
           - "dev"
-          - "--adapter_train_split"
-          - "train"
           - "--nlist"
           - "4096"
+          - "--faiss_threads"
+          - "1"
+          - "--train_size"
+          - "400000"
+          - "--train_blocks"
+          - "128"
+          - "--adapter_train_split"
+          - "train"
           - "--adapter_slug"
           - "large_scale_adapter_dpr-w100_all-MiniLM-L6-v2_nlist4096"
           - "--adapter_epochs"
@@ -94,11 +85,11 @@ spec:
           requests:
             nvidia.com/gpu: 0
             cpu: "1"
-            memory: "32Gi"
+            memory: "384Gi"
           limits:
             nvidia.com/gpu: 0
             cpu: "1"
-            memory: "64Gi"
+            memory: "448Gi"
         volumeMounts:
           - name: work
             mountPath: /mnt/work
