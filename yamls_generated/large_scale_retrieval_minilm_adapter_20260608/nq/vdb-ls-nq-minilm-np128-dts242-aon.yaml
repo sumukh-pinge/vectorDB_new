@@ -1,0 +1,116 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: vdb-ls-nq-minilm-np128-dts242-aon
+  namespace: designlab
+  labels:
+    app: "vectordb-large-scale"
+    dataset: "nq"
+    encoder: "minilm"
+    stage: "eval"
+    mode: "dts242"
+    adapter: "on"
+    nprobe: "np128"
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app: "vectordb-large-scale"
+        dataset: "nq"
+        encoder: "minilm"
+        stage: "eval"
+        mode: "dts242"
+        adapter: "on"
+        nprobe: "np128"
+    spec:
+      restartPolicy: Never
+
+      initContainers:
+      - name: wait-for-markers
+        image: busybox:1.36
+        command: ["sh", "-c", "until [ -f /mnt/work/VectorDB_MICRO/large_scale_indices/large_scale_minilm_adapter_20260608/nq/all-MiniLM-L6-v2/nlist1024/INDEX_READY.json ] && [ -f /mnt/work/VectorDB_MICRO/large_scale_indices/large_scale_minilm_adapter_20260608/nq/all-MiniLM-L6-v2/nlist1024/ADAPTER_READY_large_scale_adapter_nq_all-MiniLM-L6-v2_nlist1024.json ]; do echo waiting for /mnt/work/VectorDB_MICRO/large_scale_indices/large_scale_minilm_adapter_20260608/nq/all-MiniLM-L6-v2/nlist1024/INDEX_READY.json,/mnt/work/VectorDB_MICRO/large_scale_indices/large_scale_minilm_adapter_20260608/nq/all-MiniLM-L6-v2/nlist1024/ADAPTER_READY_large_scale_adapter_nq_all-MiniLM-L6-v2_nlist1024.json; sleep 60; done"]
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+        volumeMounts:
+          - name: work
+            mountPath: /mnt/work
+      containers:
+      - name: run
+        image: spinge/vectordb-new:20260304
+        imagePullPolicy: IfNotPresent
+        command: ["/usr/local/bin/nrp-launch"]
+        args:
+          - "python"
+          - "run_large_scale_retrieval.py"
+          - "--stage"
+          - "eval"
+          - "--dataset"
+          - "nq"
+          - "--encoder"
+          - "all-MiniLM-L6-v2"
+          - "--qrels_split"
+          - "test"
+          - "--mode"
+          - "dts242"
+          - "--adapter"
+          - "on"
+          - "--adapter_slug"
+          - "large_scale_adapter_nq_all-MiniLM-L6-v2_nlist1024"
+          - "--nlist"
+          - "1024"
+          - "--nprobe"
+          - "128"
+          - "--k2"
+          - "1000"
+          - "--kfinal"
+          - "100"
+          - "--faiss_threads"
+          - "1"
+          - "--score_chunk_size"
+          - "250000"
+        env:
+          - name: GIT_REPO
+            value: "https://github.com/sumukh-pinge/vectorDB_new.git"
+          - name: GIT_REF
+            value: "main"
+          - name: HF_HOME
+            value: "/mnt/work/hf_cache"
+          - name: TRANSFORMERS_CACHE
+            value: "/mnt/work/hf_cache"
+          - name: DATA_ROOT
+            value: "/mnt/work/VectorDB_MICRO/datasets/semantic"
+          - name: INTERMEDIATE_ROOT
+            value: "/mnt/work/VectorDB_MICRO/intermediate_data"
+          - name: INDEX_ROOT
+            value: "/mnt/work/VectorDB_MICRO/large_scale_indices/large_scale_minilm_adapter_20260608"
+          - name: RUN_ROOT
+            value: "/mnt/work/VectorDB_MICRO/large_scale_runs/large_scale_minilm_adapter_20260608"
+          - name: PYTHONUNBUFFERED
+            value: "1"
+          - name: OMP_NUM_THREADS
+            value: "1"
+          - name: MKL_NUM_THREADS
+            value: "1"
+        resources:
+          requests:
+            nvidia.com/gpu: 0
+            cpu: "1"
+            memory: "56Gi"
+          limits:
+            nvidia.com/gpu: 0
+            cpu: "1"
+            memory: "64Gi"
+        volumeMounts:
+          - name: work
+            mountPath: /mnt/work
+      volumes:
+        - name: work
+          persistentVolumeClaim:
+            claimName: sumukh-4tb

@@ -19,6 +19,10 @@ def encoder_tag(encoder: str) -> str:
     return encoder.replace("/", "_")
 
 
+def pct(done, total) -> str:
+    return f"{done}/{total} ({(100.0 * done / total) if total else 0.0:.1f}%)"
+
+
 def write_json(path: Path, obj) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -56,6 +60,24 @@ def load_query_ids(path: Path):
     return json.loads(path.read_text())
 
 
+def load_query_ids_fallback(query_ids_path: Path, queries_jsonl: Path):
+    if query_ids_path.exists():
+        return load_query_ids(query_ids_path)
+    ids = []
+    with queries_jsonl.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            ids.append(str(json.loads(line)["_id"]))
+    print(f"[paths] query_ids fallback from {queries_jsonl} count={len(ids)}", flush=True)
+    return ids
+
+
+def existing_path(candidates):
+    for path in candidates:
+        if path.exists():
+            return path
+    return candidates[0]
+
+
 def scan_positive_doc_rows(corpus_file: Path, wanted_docids: set[str]):
     doc_to_row = {}
     if not wanted_docids:
@@ -69,6 +91,75 @@ def scan_positive_doc_rows(corpus_file: Path, wanted_docids: set[str]):
                 if len(doc_to_row) == len(wanted_docids):
                     break
     return doc_to_row
+
+
+def adapter_slug(args, tag):
+    return args.adapter_slug or f"large_scale_adapter_{args.dataset}_{tag}_nlist{args.nlist}"
+
+
+def adapter_ckpt_path(paths, slug):
+    return paths["inter_dir"] / f"W_{slug}_adapter.pt"
+
+
+def adapter_ready_path(paths, slug):
+    return paths["artifacts"] / f"ADAPTER_READY_{slug}.json"
+
+
+def load_adapter_module(in_dim, bottleneck=64):
+    import torch
+    import torch.nn as nn
+
+    class Adapter(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.ln = nn.LayerNorm(in_dim)
+            self.down = nn.Linear(in_dim, bottleneck, bias=False)
+            self.up = nn.Linear(bottleneck, in_dim, bias=False)
+            self.act = nn.GELU()
+            nn.init.zeros_(self.up.weight)
+
+        def forward(self, x):
+            y = self.down(self.ln(x))
+            y = self.act(y)
+            y = self.up(y)
+            return x + y
+
+    return Adapter
+
+
+def resolve_device(device_arg):
+    if device_arg != "auto":
+        return device_arg
+    try:
+        import torch
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    except Exception:
+        return "cpu"
+
+
+def apply_adapter_to_queries(queries, ckpt_path: Path, device_arg: str, batch_size: int):
+    import torch
+
+    if not ckpt_path.exists():
+        raise FileNotFoundError(f"missing adapter checkpoint: {ckpt_path}")
+    ckpt = torch.load(str(ckpt_path), map_location="cpu")
+    in_dim = int(ckpt.get("in_dim", queries.shape[1]))
+    bottleneck = int(ckpt.get("bottleneck", 64))
+    Adapter = load_adapter_module(in_dim, bottleneck)
+    device = resolve_device(device_arg)
+    adapter = Adapter().to(device)
+    adapter.load_state_dict(ckpt["state_dict"])
+    adapter.eval()
+    out = np.empty(tuple(queries.shape), dtype=np.float32)
+    total = queries.shape[0]
+    print(f"[adapter] applying checkpoint={ckpt_path} queries={total} device={device}", flush=True)
+    with torch.no_grad():
+        for start in range(0, total, batch_size):
+            end = min(start + batch_size, total)
+            batch = torch.from_numpy(np.asarray(queries[start:end], dtype=np.float32)).to(device)
+            out[start:end] = adapter(batch).detach().cpu().numpy().astype(np.float32)
+            print(f"[adapter] applied_queries={pct(end, total)}", flush=True)
+    return out
 
 
 def qrels_to_row_sets(qrels, doc_to_row):
@@ -235,15 +326,20 @@ def get_paths(args):
     tag = encoder_tag(args.encoder)
     dataset_dir = Path(args.data_root) / args.dataset / args.dataset
     inter_dir = Path(args.intermediate_root) / args.dataset / tag
+    qrels_split = args.qrels_split
     return {
         "tag": tag,
         "dataset_dir": dataset_dir,
         "inter_dir": inter_dir,
         "embeddings": inter_dir / f"passage_embeddings_{args.dataset}_{tag}.npy",
-        "queries": inter_dir / f"query_embeddings_{args.dataset}_{tag}_{args.qrels_split}.npy",
-        "query_ids": inter_dir / f"query_ids_{args.dataset}_{tag}_{args.qrels_split}.json",
+        "queries": existing_path([
+            inter_dir / f"query_embeddings_{args.dataset}_{tag}_{qrels_split}.npy",
+            inter_dir / f"query_embeddings_{args.dataset}_{tag}.npy",
+        ]),
+        "query_ids": inter_dir / f"query_ids_{args.dataset}_{tag}_{qrels_split}.json",
+        "queries_jsonl": dataset_dir / "queries.jsonl",
         "corpus": dataset_dir / "corpus.jsonl",
-        "qrels": dataset_dir / "qrels" / f"{args.qrels_split}.tsv",
+        "qrels": dataset_dir / "qrels" / f"{qrels_split}.tsv",
         "artifacts": artifact_dir(Path(args.index_root), args.dataset, tag, args.nlist),
     }
 
@@ -260,29 +356,33 @@ def build_index(args):
 
     embeddings = np.load(paths["embeddings"], mmap_mode="r")
     n_docs, dim = embeddings.shape
-    print(f"[index] embeddings={embeddings.shape} nlist={args.nlist}", flush=True)
+    print(f"[stage=index] dataset={args.dataset} encoder={args.encoder} embeddings={embeddings.shape} nlist={args.nlist}", flush=True)
 
     train_n = min(args.train_size, n_docs)
     t_sample = time.time()
     train = load_train_sample(embeddings, n_docs, dim, train_n, args.seed, args.train_blocks)
-    print(f"[index] train_sample_n={train_n} train_sample_s={time.time() - t_sample:.1f}", flush=True)
+    print(f"[stage=index] train_sample_n={train_n} train_sample_s={time.time() - t_sample:.1f}", flush=True)
 
     quantizer = faiss.IndexFlatL2(dim)
     index = faiss.IndexIVFFlat(quantizer, dim, args.nlist, faiss.METRIC_L2)
     t0 = time.time()
+    print("[stage=index] faiss_train_start", flush=True)
     index.train(train)
     del train
-    print(f"[index] train_s={time.time() - t0:.1f}", flush=True)
+    print(f"[stage=index] faiss_train_done train_s={time.time() - t0:.1f}", flush=True)
 
     t_add = time.time()
+    print("[stage=index] faiss_add_start", flush=True)
     for start in range(0, n_docs, args.add_batch_size):
         end = min(start + args.add_batch_size, n_docs)
         index.add(np.asarray(embeddings[start:end], dtype=np.float32))
         if end % args.progress_every < args.add_batch_size or end == n_docs:
-            print(f"[index] added={end}/{n_docs}", flush=True)
-    print(f"[index] add_s={time.time() - t_add:.1f}", flush=True)
+            print(f"[stage=index] added={pct(end, n_docs)}", flush=True)
+    print(f"[stage=index] faiss_add_done add_s={time.time() - t_add:.1f}", flush=True)
 
+    print("[stage=index] write_ivf_start", flush=True)
     faiss.write_index(index, str(paths["artifacts"] / "ivf_flat.faiss"))
+    print("[stage=index] write_ivf_done", flush=True)
 
     qz = faiss.downcast_index(index.quantizer)
     centroids = np.vstack([qz.reconstruct(i) for i in range(args.nlist)]).astype(np.float32)
@@ -304,10 +404,14 @@ def build_index(args):
 
     vmin = np.full(dim, np.inf, dtype=np.float32)
     vmax = np.full(dim, -np.inf, dtype=np.float32)
+    print("[stage=index] quant_minmax_start", flush=True)
     for start in range(0, n_docs, args.quant_batch_size):
-        chunk = np.asarray(embeddings[start:start + args.quant_batch_size], dtype=np.float32)
+        end = min(start + args.quant_batch_size, n_docs)
+        chunk = np.asarray(embeddings[start:end], dtype=np.float32)
         vmin = np.minimum(vmin, chunk.min(axis=0))
         vmax = np.maximum(vmax, chunk.max(axis=0))
+        if end % args.progress_every < args.quant_batch_size or end == n_docs:
+            print(f"[stage=index] minmax={pct(end, n_docs)}", flush=True)
     np.save(paths["artifacts"] / "quant_vmin.npy", vmin)
     np.save(paths["artifacts"] / "quant_vmax.npy", vmax)
     centroids_q = quantize_chunk(centroids, vmin, vmax)
@@ -315,11 +419,12 @@ def build_index(args):
 
     codes_path = paths["artifacts"] / "base_q.uint8.npy"
     codes = np.lib.format.open_memmap(codes_path, mode="w+", dtype=np.uint8, shape=(n_docs, dim))
+    print("[stage=index] quant_encode_start", flush=True)
     for start in range(0, n_docs, args.quant_batch_size):
         end = min(start + args.quant_batch_size, n_docs)
         codes[start:end] = quantize_chunk(np.asarray(embeddings[start:end], dtype=np.float32), vmin, vmax)
         if end % args.progress_every < args.quant_batch_size or end == n_docs:
-            print(f"[quant] encoded={end}/{n_docs}", flush=True)
+            print(f"[stage=index] quant_encoded={pct(end, n_docs)}", flush=True)
     codes.flush()
 
     meta = {
@@ -335,7 +440,128 @@ def build_index(args):
         "timestamp": time.time(),
     }
     write_json(done, meta)
-    print(f"[done] index ready: {done}", flush=True)
+    print(f"[stage=index] INDEX_READY written: {done}", flush=True)
+
+
+def train_adapter(args):
+    import torch
+    import torch.nn.functional as F
+
+    paths = get_paths(args)
+    paths["artifacts"].mkdir(parents=True, exist_ok=True)
+    slug = adapter_slug(args, paths["tag"])
+    ckpt_path = adapter_ckpt_path(paths, slug)
+    ready = adapter_ready_path(paths, slug)
+    if ready.exists() and ckpt_path.exists() and not args.force:
+        print(f"[skip] adapter already ready: {ready}", flush=True)
+        return
+
+    if args.adapter_source_slug:
+        source = adapter_ckpt_path(paths, args.adapter_source_slug)
+        if not source.exists():
+            raise FileNotFoundError(f"missing source adapter: {source}")
+        ckpt_path.write_bytes(source.read_bytes())
+        w_source = paths["inter_dir"] / f"W_{args.adapter_source_slug}.npy"
+        w_dest = paths["inter_dir"] / f"W_{slug}.npy"
+        if w_source.exists():
+            w_dest.write_bytes(w_source.read_bytes())
+        write_json(ready, {
+            "dataset": args.dataset,
+            "encoder": args.encoder,
+            "adapter_slug": slug,
+            "source_slug": args.adapter_source_slug,
+            "checkpoint": str(ckpt_path),
+            "timestamp": time.time(),
+        })
+        print(f"[stage=adapter-train] ADAPTER_READY copied source={source} dest={ckpt_path}", flush=True)
+        return
+
+    embeddings = np.load(paths["embeddings"], mmap_mode="r")
+    train_paths = get_paths(argparse.Namespace(**{**vars(args), "qrels_split": args.adapter_train_split}))
+    queries = np.load(train_paths["queries"], mmap_mode="r")
+    query_ids_all = load_query_ids_fallback(train_paths["query_ids"], train_paths["queries_jsonl"])
+    qrels = read_qrels(train_paths["qrels"])
+    keep = [i for i, qid in enumerate(query_ids_all) if qid in qrels]
+    if args.adapter_max_queries:
+        keep = keep[:args.adapter_max_queries]
+    query_ids = [query_ids_all[i] for i in keep]
+    wanted_docids = set().union(*(qrels[qid] for qid in query_ids)) if query_ids else set()
+    print(f"[stage=adapter-train] scan_positive_rows positives={len(wanted_docids)}", flush=True)
+    doc_to_row = scan_positive_doc_rows(paths["corpus"], wanted_docids)
+
+    pairs = []
+    for qi, qid in zip(keep, query_ids):
+        for docid in qrels[qid]:
+            row = doc_to_row.get(docid)
+            if row is not None:
+                pairs.append((qi, int(row)))
+                if len(pairs) >= args.adapter_max_pairs:
+                    break
+        if len(pairs) >= args.adapter_max_pairs:
+            break
+    if not pairs:
+        raise RuntimeError("no adapter training pairs found")
+
+    rng = np.random.default_rng(args.seed)
+    neg_rows = rng.choice(embeddings.shape[0], size=min(args.adapter_negatives, embeddings.shape[0]), replace=False)
+    device = resolve_device(args.adapter_device)
+    dim = embeddings.shape[1]
+    Adapter = load_adapter_module(dim, args.adapter_bottleneck)
+    adapter = Adapter().to(device)
+    opt = torch.optim.AdamW(adapter.parameters(), lr=args.adapter_lr, weight_decay=1e-4)
+    neg_tensor = torch.from_numpy(np.asarray(embeddings[neg_rows], dtype=np.float32)).to(device)
+    neg_tensor = F.normalize(neg_tensor, p=2, dim=1)
+    pair_arr = np.asarray(pairs, dtype=np.int64)
+    steps_per_epoch = int(math.ceil(len(pair_arr) / args.adapter_qbatch))
+    print(
+        f"[stage=adapter-train] dataset={args.dataset} pairs={len(pair_arr)} negatives={len(neg_rows)} "
+        f"epochs={args.adapter_epochs} batch={args.adapter_qbatch} device={device}",
+        flush=True,
+    )
+
+    for epoch in range(args.adapter_epochs):
+        order = rng.permutation(len(pair_arr))
+        running = 0.0
+        for step in range(steps_per_epoch):
+            idx = order[step * args.adapter_qbatch:(step + 1) * args.adapter_qbatch]
+            batch = pair_arr[idx]
+            q_np = np.asarray(queries[batch[:, 0]], dtype=np.float32)
+            p_np = np.asarray(embeddings[batch[:, 1]], dtype=np.float32)
+            q = torch.from_numpy(q_np).to(device)
+            p = torch.from_numpy(p_np).to(device)
+            q_proj = adapter(q)
+            q_norm = F.normalize(q_proj, p=2, dim=1)
+            p_norm = F.normalize(p, p=2, dim=1)
+            pos = (q_norm * p_norm).sum(dim=1, keepdim=True)
+            neg = q_norm @ neg_tensor.t()
+            logits = torch.cat([pos, neg], dim=1) / args.adapter_tau
+            labels = torch.zeros(q.shape[0], dtype=torch.long, device=device)
+            loss = F.cross_entropy(logits, labels)
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(adapter.parameters(), args.adapter_grad_clip)
+            opt.step()
+            running += float(loss.detach().cpu())
+            if (step + 1) % args.adapter_progress_every == 0 or step + 1 == steps_per_epoch:
+                print(
+                    f"[stage=adapter-train] epoch={epoch + 1}/{args.adapter_epochs} "
+                    f"steps={pct(step + 1, steps_per_epoch)} loss={running / (step + 1):.4f}",
+                    flush=True,
+                )
+
+    torch.save({"state_dict": adapter.state_dict(), "in_dim": dim, "bottleneck": args.adapter_bottleneck}, ckpt_path)
+    np.save(paths["inter_dir"] / f"W_{slug}.npy", np.eye(dim, dtype=np.float32))
+    write_json(ready, {
+        "dataset": args.dataset,
+        "encoder": args.encoder,
+        "adapter_slug": slug,
+        "checkpoint": str(ckpt_path),
+        "pairs": int(len(pair_arr)),
+        "negatives": int(len(neg_rows)),
+        "epochs": int(args.adapter_epochs),
+        "timestamp": time.time(),
+    })
+    print(f"[stage=adapter-train] ADAPTER_READY written: {ready}", flush=True)
 
 
 def selected_candidate_ids(centroids, centroids_q, offsets, list_ids, q_vec, q_code, nprobe, mode_m):
@@ -362,7 +588,7 @@ def selected_candidate_ids(centroids, centroids_q, offsets, list_ids, q_vec, q_c
 def eval_retrieval(args):
     paths = get_paths(args)
     mode_tag = args.mode
-    out_dir = Path(args.run_root) / args.dataset / paths["tag"] / f"nlist{args.nlist}" / f"np{args.nprobe}" / mode_tag
+    out_dir = Path(args.run_root) / args.dataset / paths["tag"] / f"nlist{args.nlist}" / f"np{args.nprobe}" / mode_tag / f"adapter_{args.adapter}"
     summary_json = out_dir / "summary.json"
     if summary_json.exists() and not args.force:
         print(f"[skip] summary exists: {summary_json}", flush=True)
@@ -376,14 +602,23 @@ def eval_retrieval(args):
     t_load = time.time()
     embeddings = np.load(paths["embeddings"], mmap_mode="r")
     queries = np.load(paths["queries"], mmap_mode="r")
-    query_ids_all = load_query_ids(paths["query_ids"])
+    query_ids_all = load_query_ids_fallback(paths["query_ids"], paths["queries_jsonl"])
     qrels = read_qrels(paths["qrels"])
     keep = [i for i, qid in enumerate(query_ids_all) if qid in qrels]
     if args.max_queries:
         keep = keep[:args.max_queries]
     query_ids = [query_ids_all[i] for i in keep]
     queries = queries[keep]
+    if args.adapter == "on":
+        slug = adapter_slug(args, paths["tag"])
+        ckpt_path = adapter_ckpt_path(paths, slug)
+        queries = apply_adapter_to_queries(queries, ckpt_path, args.adapter_device, args.adapter_batch_size)
     wanted_docids = set().union(*(qrels[qid] for qid in query_ids)) if query_ids else set()
+    print(
+        f"[stage=eval] dataset={args.dataset} mode={args.mode} adapter={args.adapter} "
+        f"nlist={args.nlist} nprobe={args.nprobe} queries={len(query_ids)} qrels_positives={len(wanted_docids)}",
+        flush=True,
+    )
     doc_to_row = scan_positive_doc_rows(paths["corpus"], wanted_docids)
     qrels_rows, missing_qrels = qrels_to_row_sets({qid: qrels[qid] for qid in query_ids}, doc_to_row)
 
@@ -445,7 +680,7 @@ def eval_retrieval(args):
             "R@100": (len(gt & set(final_list[:100])) / len(gt)) if gt else 0.0,
         })
         if qi % args.progress_every_queries == 0 or qi == len(query_ids):
-            print(f"[eval] queries={qi}/{len(query_ids)} last_raw={raw_count}", flush=True)
+            print(f"[stage=eval] queries={pct(qi, len(query_ids))} last_raw={raw_count}", flush=True)
     t_eval = time.time() - t_eval
 
     metric_row = metrics(query_ids, retrieved, qrels_rows)
@@ -458,6 +693,7 @@ def eval_retrieval(args):
         "encoder": args.encoder,
         "encoder_tag": paths["tag"],
         "mode": args.mode,
+        "adapter": args.adapter,
         "nlist": args.nlist,
         "nprobe": args.nprobe,
         "k2": args.k2,
@@ -478,15 +714,31 @@ def eval_retrieval(args):
     write_json(summary_json, summary)
     write_csv(out_dir / "summary.csv", [summary], list(summary.keys()))
     write_csv(out_dir / "per_query.csv", per_query, list(per_query[0].keys()) if per_query else [])
-    print(f"[done] wrote {summary_json}", flush=True)
+    print(f"[stage=eval] summary written: {summary_json}", flush=True)
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--stage", choices=["build-index", "eval"], required=True)
+    parser.add_argument("--stage", choices=["build-index", "train-adapter", "eval"], required=True)
     parser.add_argument("--dataset", required=True)
     parser.add_argument("--encoder", required=True)
     parser.add_argument("--mode", choices=["ivf", "dts111", "dts242"], default="ivf")
+    parser.add_argument("--adapter", choices=["off", "on"], default="off")
+    parser.add_argument("--adapter_slug", default="")
+    parser.add_argument("--adapter_source_slug", default="")
+    parser.add_argument("--adapter_train_split", default="train")
+    parser.add_argument("--adapter_device", default="auto")
+    parser.add_argument("--adapter_batch_size", type=int, default=1024)
+    parser.add_argument("--adapter_bottleneck", type=int, default=64)
+    parser.add_argument("--adapter_epochs", type=int, default=1)
+    parser.add_argument("--adapter_lr", type=float, default=1e-3)
+    parser.add_argument("--adapter_tau", type=float, default=0.07)
+    parser.add_argument("--adapter_grad_clip", type=float, default=1.0)
+    parser.add_argument("--adapter_qbatch", type=int, default=256)
+    parser.add_argument("--adapter_negatives", type=int, default=4096)
+    parser.add_argument("--adapter_max_queries", type=int, default=50000)
+    parser.add_argument("--adapter_max_pairs", type=int, default=100000)
+    parser.add_argument("--adapter_progress_every", type=int, default=25)
     parser.add_argument("--data_root", default=os.getenv("DATA_ROOT", "/mnt/work/VectorDB_MICRO/datasets/semantic"))
     parser.add_argument("--intermediate_root", default=os.getenv("INTERMEDIATE_ROOT", "/mnt/work/VectorDB_MICRO/intermediate_data"))
     parser.add_argument("--index_root", default=os.getenv("INDEX_ROOT", "/mnt/work/VectorDB_MICRO/large_scale_indices"))
@@ -512,6 +764,8 @@ def main():
 
     if args.stage == "build-index":
         build_index(args)
+    elif args.stage == "train-adapter":
+        train_adapter(args)
     else:
         eval_retrieval(args)
 
