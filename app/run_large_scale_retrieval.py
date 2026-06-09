@@ -166,6 +166,10 @@ def positive_row_cache_path(args, paths):
     return hard_cache_dir(args, paths) / "positive_rows.json"
 
 
+def eval_positive_row_cache_path(paths, qrels_split):
+    return paths["artifacts"] / f"positive_rows_{qrels_split}.json"
+
+
 def eval_base_out_dir(args, paths):
     mode_tag = args.mode
     adapter_result_tag = args.result_adapter_tag or args.adapter
@@ -775,6 +779,68 @@ def load_positive_row_cache(args, paths, wanted_docids):
     return doc_to_row
 
 
+def build_eval_positive_row_cache(args):
+    paths = get_paths(args)
+    out_path = eval_positive_row_cache_path(paths, args.qrels_split)
+    if out_path.exists() and not args.force:
+        print(f"[skip] eval positive row cache exists: {out_path}", flush=True)
+        return
+
+    t0 = time.time()
+    query_ids_all = load_query_ids_fallback(paths["query_ids"], paths["queries_jsonl"])
+    qrels = read_qrels(paths["qrels"])
+    keep = [i for i, qid in enumerate(query_ids_all) if qid in qrels]
+    if args.max_queries:
+        keep = keep[:args.max_queries]
+    qids = [query_ids_all[i] for i in keep]
+    wanted_docids = set().union(*(qrels[qid] for qid in qids)) if qids else set()
+    print(
+        f"[stage=eval-positive-row-cache] dataset={args.dataset} split={args.qrels_split} "
+        f"selected_queries={len(keep)} wanted_docids={len(wanted_docids)} out={out_path}",
+        flush=True,
+    )
+    doc_to_row = scan_positive_doc_rows_with_progress(paths["corpus"], wanted_docids, args.progress_every)
+    missing = sorted(wanted_docids.difference(doc_to_row))
+    write_json(out_path, {
+        "dataset": args.dataset,
+        "encoder": args.encoder,
+        "encoder_tag": paths["tag"],
+        "qrels_split": args.qrels_split,
+        "nlist": args.nlist,
+        "selected_queries": len(keep),
+        "wanted_docids": len(wanted_docids),
+        "found_docids": len(doc_to_row),
+        "missing_docids": len(missing),
+        "doc_to_row": {str(k): int(v) for k, v in doc_to_row.items()},
+        "missing_docid_examples": missing[:20],
+        "elapsed_s": time.time() - t0,
+        "timestamp": time.time(),
+    })
+    print(
+        f"[stage=eval-positive-row-cache] wrote {out_path} "
+        f"found={len(doc_to_row)}/{len(wanted_docids)} elapsed_s={time.time() - t0:.1f}",
+        flush=True,
+    )
+
+
+def load_eval_positive_row_cache(args, paths, wanted_docids):
+    path = eval_positive_row_cache_path(paths, args.qrels_split)
+    if not path.exists():
+        print(f"[stage=eval] eval positive row cache missing; scanning corpus: {path}", flush=True)
+        return scan_positive_doc_rows(paths["corpus"], wanted_docids)
+    cache = json.loads(path.read_text())
+    raw = cache.get("doc_to_row", {})
+    doc_to_row = {str(docid): int(row) for docid, row in raw.items() if str(docid) in wanted_docids}
+    missing = wanted_docids.difference(doc_to_row)
+    if missing:
+        print(
+            f"[stage=eval] eval_positive_row_cache missing={len(missing)}/{len(wanted_docids)} "
+            f"examples={sorted(missing)[:5]}",
+            flush=True,
+        )
+    return doc_to_row
+
+
 def retrieve_rows_for_mining(
     embeddings,
     base_q,
@@ -1149,7 +1215,7 @@ def eval_retrieval(args):
         f"queries={len(query_ids)}/{total_queries_before_shard} qrels_positives={len(wanted_docids)}",
         flush=True,
     )
-    doc_to_row = scan_positive_doc_rows(paths["corpus"], wanted_docids)
+    doc_to_row = load_eval_positive_row_cache(args, paths, wanted_docids)
     qrels_rows, missing_qrels = qrels_to_row_sets({qid: qrels[qid] for qid in query_ids}, doc_to_row)
 
     centroids = np.load(paths["artifacts"] / "centroids.npy", mmap_mode="r")
@@ -1352,6 +1418,7 @@ def main():
             "train-adapter",
             "prep",
             "build-positive-row-cache",
+            "build-eval-positive-row-cache",
             "mine-hard-negatives",
             "merge-hard-negatives",
             "train-from-neg-cache",
@@ -1427,6 +1494,8 @@ def main():
         print("[stage=prep] complete INDEX_READY and ADAPTER_READY", flush=True)
     elif args.stage == "build-positive-row-cache":
         build_positive_row_cache(args)
+    elif args.stage == "build-eval-positive-row-cache":
+        build_eval_positive_row_cache(args)
     elif args.stage == "mine-hard-negatives":
         mine_hard_negatives(args)
     elif args.stage == "merge-hard-negatives":
