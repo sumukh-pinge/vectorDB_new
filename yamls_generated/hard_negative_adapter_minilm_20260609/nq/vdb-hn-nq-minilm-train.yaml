@@ -1,0 +1,126 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: vdb-hn-nq-minilm-train
+  namespace: designlab
+  labels:
+    app: "vectordb-hardneg"
+    dataset: "nq"
+    encoder: "minilm"
+    stage: "train"
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app: "vectordb-hardneg"
+        dataset: "nq"
+        encoder: "minilm"
+        stage: "train"
+    spec:
+      restartPolicy: Never
+
+      initContainers:
+      - name: wait-for-markers
+        image: busybox:1.36
+        command: ["sh", "-c", "until [ -f /mnt/work/VectorDB_MICRO/large_scale_indices/large_scale_minilm_adapter_20260608/nq/all-MiniLM-L6-v2/nlist1024/hard_negative_cache/nq_all-MiniLM-L6-v2_nlist1024_splittest_np64_ms1_1_1_seed123_subset5000_k10/merged.json ]; do echo waiting for /mnt/work/VectorDB_MICRO/large_scale_indices/large_scale_minilm_adapter_20260608/nq/all-MiniLM-L6-v2/nlist1024/hard_negative_cache/nq_all-MiniLM-L6-v2_nlist1024_splittest_np64_ms1_1_1_seed123_subset5000_k10/merged.json; sleep 60; done"]
+        resources:
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
+          limits:
+            cpu: "100m"
+            memory: "128Mi"
+        volumeMounts:
+          - name: work
+            mountPath: /mnt/work
+      containers:
+      - name: run
+        image: spinge/vectordb-new:20260304
+        imagePullPolicy: IfNotPresent
+        command: ["/usr/local/bin/nrp-launch"]
+        args:
+          - "python"
+          - "run_large_scale_retrieval.py"
+          - "--stage"
+          - "train-from-neg-cache"
+          - "--dataset"
+          - "nq"
+          - "--encoder"
+          - "all-MiniLM-L6-v2"
+          - "--qrels_split"
+          - "test"
+          - "--adapter_train_split"
+          - "test"
+          - "--nlist"
+          - "1024"
+          - "--nprobe"
+          - "64"
+          - "--k2"
+          - "1000"
+          - "--kfinal"
+          - "100"
+          - "--faiss_threads"
+          - "1"
+          - "--score_chunk_size"
+          - "250000"
+          - "--hard_ms"
+          - "1,1,1"
+          - "--hard_max_queries"
+          - "5000"
+          - "--hard_num_shards"
+          - "1"
+          - "--adapter_max_pairs"
+          - "100000"
+          - "--adapter_slug"
+          - "hardneg_nq_all-MiniLM-L6-v2_nlist1024_ms1_1_1_subset5000"
+          - "--adapter_epochs"
+          - "5"
+          - "--adapter_checkpoint_epochs"
+          - "1,2,3,5"
+          - "--adapter_qbatch"
+          - "256"
+          - "--adapter_device"
+          - "cpu"
+          - "--hard_train_negatives"
+          - "50000"
+        env:
+          - name: GIT_REPO
+            value: "https://github.com/sumukh-pinge/vectorDB_new.git"
+          - name: GIT_REF
+            value: "main"
+          - name: HF_HOME
+            value: "/mnt/work/hf_cache"
+          - name: TRANSFORMERS_CACHE
+            value: "/mnt/work/hf_cache"
+          - name: DATA_ROOT
+            value: "/mnt/work/VectorDB_MICRO/datasets/semantic"
+          - name: INTERMEDIATE_ROOT
+            value: "/mnt/work/VectorDB_MICRO/intermediate_data"
+          - name: INDEX_ROOT
+            value: "/mnt/work/VectorDB_MICRO/large_scale_indices/large_scale_minilm_adapter_20260608"
+          - name: RUN_ROOT
+            value: "/mnt/work/VectorDB_MICRO/large_scale_runs/large_scale_hardneg_minilm_20260609"
+          - name: PYTHONUNBUFFERED
+            value: "1"
+          - name: OMP_NUM_THREADS
+            value: "1"
+          - name: MKL_NUM_THREADS
+            value: "1"
+        resources:
+          requests:
+            nvidia.com/gpu: 0
+            cpu: "1"
+            memory: "56Gi"
+          limits:
+            nvidia.com/gpu: 0
+            cpu: "1"
+            memory: "64Gi"
+        volumeMounts:
+          - name: work
+            mountPath: /mnt/work
+      volumes:
+        - name: work
+          persistentVolumeClaim:
+            claimName: sumukh-4tb

@@ -1,0 +1,105 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: vdb-hn-dpr-w100-minilm-mine-s5
+  namespace: designlab
+  labels:
+    app: "vectordb-hardneg"
+    dataset: "dpr-w100"
+    encoder: "minilm"
+    stage: "mine"
+    shard: "5"
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app: "vectordb-hardneg"
+        dataset: "dpr-w100"
+        encoder: "minilm"
+        stage: "mine"
+        shard: "5"
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: run
+        image: spinge/vectordb-new:20260304
+        imagePullPolicy: IfNotPresent
+        command: ["/usr/local/bin/nrp-launch"]
+        args:
+          - "python"
+          - "run_large_scale_retrieval.py"
+          - "--stage"
+          - "mine-hard-negatives"
+          - "--dataset"
+          - "dpr-w100"
+          - "--encoder"
+          - "all-MiniLM-L6-v2"
+          - "--qrels_split"
+          - "dev"
+          - "--adapter_train_split"
+          - "train"
+          - "--nlist"
+          - "4096"
+          - "--nprobe"
+          - "128"
+          - "--k2"
+          - "1000"
+          - "--kfinal"
+          - "100"
+          - "--faiss_threads"
+          - "1"
+          - "--score_chunk_size"
+          - "250000"
+          - "--hard_ms"
+          - "1,1,1"
+          - "--hard_max_queries"
+          - "10000"
+          - "--hard_num_shards"
+          - "8"
+          - "--adapter_max_pairs"
+          - "100000"
+          - "--adapter_slug"
+          - "hardneg_dpr-w100_all-MiniLM-L6-v2_nlist4096_ms1_1_1_subset10000"
+          - "--hard_shard_id"
+          - "5"
+        env:
+          - name: GIT_REPO
+            value: "https://github.com/sumukh-pinge/vectorDB_new.git"
+          - name: GIT_REF
+            value: "main"
+          - name: HF_HOME
+            value: "/mnt/work/hf_cache"
+          - name: TRANSFORMERS_CACHE
+            value: "/mnt/work/hf_cache"
+          - name: DATA_ROOT
+            value: "/mnt/work/VectorDB_MICRO/datasets/semantic"
+          - name: INTERMEDIATE_ROOT
+            value: "/mnt/work/VectorDB_MICRO/intermediate_data"
+          - name: INDEX_ROOT
+            value: "/mnt/work/VectorDB_MICRO/large_scale_indices/large_scale_minilm_adapter_20260608"
+          - name: RUN_ROOT
+            value: "/mnt/work/VectorDB_MICRO/large_scale_runs/large_scale_hardneg_minilm_20260609"
+          - name: PYTHONUNBUFFERED
+            value: "1"
+          - name: OMP_NUM_THREADS
+            value: "1"
+          - name: MKL_NUM_THREADS
+            value: "1"
+        resources:
+          requests:
+            nvidia.com/gpu: 0
+            cpu: "1"
+            memory: "56Gi"
+          limits:
+            nvidia.com/gpu: 0
+            cpu: "1"
+            memory: "64Gi"
+        volumeMounts:
+          - name: work
+            mountPath: /mnt/work
+      volumes:
+        - name: work
+          persistentVolumeClaim:
+            claimName: sumukh-4tb

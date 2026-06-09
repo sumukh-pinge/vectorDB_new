@@ -163,6 +163,9 @@ def train_W_param(emb_np, que_np, d_out, save_path, passage_ids_sample,
     pid_to_idx = {str(pid): i for i, pid in enumerate(passage_ids_sample)}
     # query id → row mapping
     qid_to_row = {str(qid): i for i, qid in enumerate(query_ids_sample)}
+    if subset and subset > 0 and len(query_ids_sample) > subset:
+        query_ids_sample = query_ids_sample[:subset]
+        print(f"[train] adapt_subset active: using {len(query_ids_sample)} queries", flush=True)
 
     # positive pairs
     train_qidx, train_pidx = [], []

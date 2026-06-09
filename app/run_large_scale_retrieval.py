@@ -105,6 +105,41 @@ def adapter_ready_path(paths, slug):
     return paths["artifacts"] / f"ADAPTER_READY_{slug}.json"
 
 
+def parse_int_tuple(text: str):
+    vals = tuple(int(x.strip()) for x in text.split(",") if x.strip())
+    if len(vals) != 3:
+        raise ValueError(f"expected three comma-separated ints, got: {text}")
+    return vals
+
+
+def ms_tag(ms):
+    return "_".join(str(x) for x in ms)
+
+
+def hard_cache_slug(args):
+    ms = parse_int_tuple(args.hard_ms)
+    subset = int(args.hard_max_queries or args.adapter_max_queries or 0)
+    return (
+        f"{args.dataset}_{encoder_tag(args.encoder)}_nlist{args.nlist}"
+        f"_split{args.adapter_train_split}_np{args.nprobe}_ms{ms_tag(ms)}"
+        f"_seed{args.seed}_subset{subset}_k{args.hard_negatives_per_query}"
+    )
+
+
+def hard_cache_dir(args, paths):
+    root = Path(args.hard_cache_root) if args.hard_cache_root else paths["artifacts"] / "hard_negative_cache"
+    return root / hard_cache_slug(args)
+
+
+def hard_shard_path(args, paths, shard_id=None):
+    shard = args.hard_shard_id if shard_id is None else shard_id
+    return hard_cache_dir(args, paths) / f"shard_{shard:04d}_of_{args.hard_num_shards:04d}.json"
+
+
+def hard_merged_path(args, paths):
+    return hard_cache_dir(args, paths) / "merged.json"
+
+
 def load_adapter_module(in_dim, bottleneck=64):
     import torch
     import torch.nn as nn
@@ -585,10 +620,327 @@ def selected_candidate_ids(centroids, centroids_q, offsets, list_ids, q_vec, q_c
     return out
 
 
+def load_training_queries(args, paths):
+    train_paths = get_paths(argparse.Namespace(**{**vars(args), "qrels_split": args.adapter_train_split}))
+    queries = np.load(train_paths["queries"], mmap_mode="r")
+    query_ids_all = load_query_ids_fallback(train_paths["query_ids"], train_paths["queries_jsonl"])
+    qrels = read_qrels(train_paths["qrels"])
+    keep = [i for i, qid in enumerate(query_ids_all) if qid in qrels]
+    max_queries = int(args.hard_max_queries or args.adapter_max_queries or 0)
+    if max_queries:
+        keep = keep[:max_queries]
+    if args.hard_num_shards < 1:
+        raise ValueError("--hard_num_shards must be >= 1")
+    if not (0 <= args.hard_shard_id < args.hard_num_shards):
+        raise ValueError("--hard_shard_id must be in [0, hard_num_shards)")
+    shard_keep = keep[args.hard_shard_id::args.hard_num_shards]
+    shard_qids = [query_ids_all[i] for i in shard_keep]
+    return train_paths, queries, query_ids_all, qrels, keep, shard_keep, shard_qids
+
+
+def retrieve_rows_for_mining(
+    embeddings,
+    base_q,
+    centroids,
+    centroids_q,
+    offsets,
+    list_ids,
+    vmin,
+    vmax,
+    q_vec,
+    nprobe,
+    k2,
+    kfinal,
+    score_chunk_size,
+    ms,
+):
+    q_vec = np.asarray(q_vec, dtype=np.float32)
+    q_code = quantize_chunk(q_vec[None, :], vmin, vmax)[0]
+    candidate_ids = selected_candidate_ids(centroids, centroids_q, offsets, list_ids, q_vec, q_code, nprobe, ms[0])
+    if candidate_ids.size == 0:
+        return np.empty(0, dtype=np.int64), 0
+    stage2 = chunked_dts_topk(base_q, candidate_ids, q_code, ms[1], min(k2, candidate_ids.size), score_chunk_size)
+    final = chunked_dts_topk(base_q, stage2, q_code, ms[2], min(kfinal, stage2.size), score_chunk_size)
+    return final, int(candidate_ids.size)
+
+
+def mine_hard_negatives(args):
+    paths = get_paths(args)
+    ready = paths["artifacts"] / "INDEX_READY.json"
+    if not ready.exists():
+        raise FileNotFoundError(f"missing index marker: {ready}")
+
+    out_path = hard_shard_path(args, paths)
+    if out_path.exists() and not args.force:
+        print(f"[skip] hard-negative shard exists: {out_path}", flush=True)
+        return
+
+    ms = parse_int_tuple(args.hard_ms)
+    t0 = time.time()
+    train_paths, queries, query_ids_all, qrels, keep_all, shard_keep, shard_qids = load_training_queries(args, paths)
+    wanted_docids = set().union(*(qrels[qid] for qid in shard_qids)) if shard_qids else set()
+    print(
+        f"[stage=mine-hard] dataset={args.dataset} split={args.adapter_train_split} "
+        f"selected_total={len(keep_all)} shard={args.hard_shard_id}/{args.hard_num_shards} "
+        f"shard_queries={len(shard_keep)} positives={len(wanted_docids)} ms={ms}",
+        flush=True,
+    )
+    doc_to_row = scan_positive_doc_rows(paths["corpus"], wanted_docids)
+
+    embeddings = np.load(paths["embeddings"], mmap_mode="r")
+    centroids = np.load(paths["artifacts"] / "centroids.npy", mmap_mode="r")
+    centroids_q = np.load(paths["artifacts"] / "centroids_q.npy", mmap_mode="r")
+    offsets = np.load(paths["artifacts"] / "list_offsets.npy", mmap_mode="r")
+    list_ids = np.load(paths["artifacts"] / "list_ids.npy", mmap_mode="r")
+    vmin = np.load(paths["artifacts"] / "quant_vmin.npy")
+    vmax = np.load(paths["artifacts"] / "quant_vmax.npy")
+    base_q = np.load(paths["artifacts"] / "base_q.uint8.npy", mmap_mode="r")
+
+    pairs = []
+    negatives = []
+    rows = []
+    skipped_no_positive = 0
+    skipped_no_negative = 0
+    raw_counts = []
+    for local_idx, (qrow, qid) in enumerate(zip(shard_keep, shard_qids), 1):
+        pos_rows = []
+        for docid in qrels[qid]:
+            row = doc_to_row.get(docid)
+            if row is not None:
+                pos_rows.append(int(row))
+                pairs.append([int(qrow), int(row)])
+        if not pos_rows:
+            skipped_no_positive += 1
+            continue
+        final, raw_count = retrieve_rows_for_mining(
+            embeddings, base_q, centroids, centroids_q, offsets, list_ids, vmin, vmax,
+            np.asarray(queries[qrow], dtype=np.float32), args.nprobe, args.k2, args.kfinal,
+            args.score_chunk_size, ms,
+        )
+        raw_counts.append(raw_count)
+        pos_set = set(pos_rows)
+        neg_rows = [int(row) for row in final if int(row) not in pos_set][:args.hard_negatives_per_query]
+        if not neg_rows:
+            skipped_no_negative += 1
+        negatives.extend(neg_rows)
+        rows.append({
+            "query_id": qid,
+            "query_row": int(qrow),
+            "positive_rows": pos_rows,
+            "negative_rows": neg_rows,
+            "raw_candidates": int(raw_count),
+        })
+        if local_idx % args.progress_every_queries == 0 or local_idx == len(shard_keep):
+            print(
+                f"[stage=mine-hard] queries={pct(local_idx, len(shard_keep))} "
+                f"pairs={len(pairs)} negatives={len(negatives)} last_raw={raw_count}",
+                flush=True,
+            )
+
+    obj = {
+        "dataset": args.dataset,
+        "encoder": args.encoder,
+        "encoder_tag": paths["tag"],
+        "adapter_train_split": args.adapter_train_split,
+        "nlist": args.nlist,
+        "nprobe": args.nprobe,
+        "k2": args.k2,
+        "kfinal": args.kfinal,
+        "ms": list(ms),
+        "seed": args.seed,
+        "selected_total_queries": len(keep_all),
+        "shard_id": args.hard_shard_id,
+        "num_shards": args.hard_num_shards,
+        "shard_queries": len(shard_keep),
+        "pairs": pairs,
+        "negative_rows": negatives,
+        "rows": rows,
+        "skipped_no_positive": skipped_no_positive,
+        "skipped_no_negative": skipped_no_negative,
+        "raw_candidates_avg": float(np.mean(raw_counts)) if raw_counts else 0.0,
+        "elapsed_s": time.time() - t0,
+        "timestamp": time.time(),
+    }
+    write_json(out_path, obj)
+    print(f"[stage=mine-hard] wrote {out_path} pairs={len(pairs)} negatives={len(negatives)}", flush=True)
+
+
+def merge_hard_negatives(args):
+    paths = get_paths(args)
+    out_path = hard_merged_path(args, paths)
+    if out_path.exists() and not args.force:
+        print(f"[skip] merged hard-negative cache exists: {out_path}", flush=True)
+        return
+
+    shards = []
+    missing = []
+    for shard_id in range(args.hard_num_shards):
+        path = hard_shard_path(args, paths, shard_id)
+        if path.exists():
+            shards.append(json.loads(path.read_text()))
+        else:
+            missing.append(str(path))
+    if missing:
+        raise FileNotFoundError(f"missing {len(missing)} shard files; first={missing[:3]}")
+
+    pairs = []
+    negatives = []
+    rows = []
+    for shard in sorted(shards, key=lambda x: int(x["shard_id"])):
+        pairs.extend(shard.get("pairs", []))
+        negatives.extend(shard.get("negative_rows", []))
+        rows.extend(shard.get("rows", []))
+    rows = sorted(rows, key=lambda r: int(r["query_row"]))
+    obj = {
+        "dataset": args.dataset,
+        "encoder": args.encoder,
+        "encoder_tag": paths["tag"],
+        "adapter_train_split": args.adapter_train_split,
+        "nlist": args.nlist,
+        "nprobe": args.nprobe,
+        "k2": args.k2,
+        "kfinal": args.kfinal,
+        "ms": list(parse_int_tuple(args.hard_ms)),
+        "seed": args.seed,
+        "num_shards": args.hard_num_shards,
+        "pairs": pairs,
+        "negative_rows": negatives,
+        "rows": rows,
+        "query_count": len(rows),
+        "pair_count": len(pairs),
+        "negative_count": len(negatives),
+        "timestamp": time.time(),
+    }
+    write_json(out_path, obj)
+    print(f"[stage=merge-hard] wrote {out_path} queries={len(rows)} pairs={len(pairs)} negatives={len(negatives)}", flush=True)
+
+
+def train_adapter_from_neg_cache(args):
+    import torch
+    import torch.nn.functional as F
+
+    paths = get_paths(args)
+    cache_path = hard_merged_path(args, paths)
+    if not cache_path.exists() and args.hard_num_shards == 1:
+        cache_path = hard_shard_path(args, paths, 0)
+    if not cache_path.exists():
+        raise FileNotFoundError(f"missing hard-negative cache: {cache_path}")
+
+    slug = adapter_slug(args, paths["tag"])
+    final_ckpt_path = adapter_ckpt_path(paths, slug)
+    ready = adapter_ready_path(paths, slug)
+    if ready.exists() and final_ckpt_path.exists() and not args.force:
+        print(f"[skip] cached-hard adapter already ready: {ready}", flush=True)
+        return
+
+    cache = json.loads(cache_path.read_text())
+    pairs = cache.get("pairs", [])
+    neg_rows_all = [int(x) for x in cache.get("negative_rows", [])]
+    if not pairs:
+        raise RuntimeError(f"hard-negative cache has no positive pairs: {cache_path}")
+    if not neg_rows_all:
+        raise RuntimeError(f"hard-negative cache has no negatives: {cache_path}")
+
+    rng = np.random.default_rng(args.seed)
+    if args.hard_train_negatives and len(neg_rows_all) > args.hard_train_negatives:
+        idx = rng.choice(len(neg_rows_all), size=args.hard_train_negatives, replace=False)
+        neg_rows = [neg_rows_all[int(i)] for i in idx]
+    else:
+        neg_rows = neg_rows_all
+
+    embeddings = np.load(paths["embeddings"], mmap_mode="r")
+    train_paths = get_paths(argparse.Namespace(**{**vars(args), "qrels_split": args.adapter_train_split}))
+    queries = np.load(train_paths["queries"], mmap_mode="r")
+    device = resolve_device(args.adapter_device)
+    dim = embeddings.shape[1]
+    Adapter = load_adapter_module(dim, args.adapter_bottleneck)
+    adapter = Adapter().to(device)
+    opt = torch.optim.AdamW(adapter.parameters(), lr=args.adapter_lr, weight_decay=1e-4)
+    neg_tensor = torch.from_numpy(np.asarray(embeddings[neg_rows], dtype=np.float32)).to(device)
+    neg_tensor = F.normalize(neg_tensor, p=2, dim=1)
+    pair_arr = np.asarray(pairs[:args.adapter_max_pairs] if args.adapter_max_pairs else pairs, dtype=np.int64)
+    steps_per_epoch = int(math.ceil(len(pair_arr) / args.adapter_qbatch))
+    checkpoint_epochs = sorted({int(x.strip()) for x in args.adapter_checkpoint_epochs.split(",") if x.strip()})
+    print(
+        f"[stage=train-hard] dataset={args.dataset} slug={slug} pairs={len(pair_arr)} "
+        f"cache_negatives={len(neg_rows_all)} train_negatives={len(neg_rows)} "
+        f"epochs={args.adapter_epochs} checkpoints={checkpoint_epochs} batch={args.adapter_qbatch} device={device}",
+        flush=True,
+    )
+
+    epoch_losses = []
+    for epoch in range(args.adapter_epochs):
+        order = rng.permutation(len(pair_arr))
+        running = 0.0
+        for step in range(steps_per_epoch):
+            idx = order[step * args.adapter_qbatch:(step + 1) * args.adapter_qbatch]
+            batch = pair_arr[idx]
+            q_np = np.asarray(queries[batch[:, 0]], dtype=np.float32)
+            p_np = np.asarray(embeddings[batch[:, 1]], dtype=np.float32)
+            q = torch.from_numpy(q_np).to(device)
+            p = torch.from_numpy(p_np).to(device)
+            q_proj = adapter(q)
+            q_norm = F.normalize(q_proj, p=2, dim=1)
+            p_norm = F.normalize(p, p=2, dim=1)
+            pos = (q_norm * p_norm).sum(dim=1, keepdim=True)
+            neg = q_norm @ neg_tensor.t()
+            logits = torch.cat([pos, neg], dim=1) / args.adapter_tau
+            labels = torch.zeros(q.shape[0], dtype=torch.long, device=device)
+            loss = F.cross_entropy(logits, labels)
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(adapter.parameters(), args.adapter_grad_clip)
+            opt.step()
+            running += float(loss.detach().cpu())
+            if (step + 1) % args.adapter_progress_every == 0 or step + 1 == steps_per_epoch:
+                print(
+                    f"[stage=train-hard] epoch={epoch + 1}/{args.adapter_epochs} "
+                    f"steps={pct(step + 1, steps_per_epoch)} loss={running / (step + 1):.4f}",
+                    flush=True,
+                )
+        epoch_loss = running / max(1, steps_per_epoch)
+        epoch_losses.append(epoch_loss)
+        if (epoch + 1) in checkpoint_epochs:
+            epoch_slug = f"{slug}_epoch{epoch + 1}"
+            epoch_ckpt = adapter_ckpt_path(paths, epoch_slug)
+            torch.save({"state_dict": adapter.state_dict(), "in_dim": dim, "bottleneck": args.adapter_bottleneck}, epoch_ckpt)
+            np.save(paths["inter_dir"] / f"W_{epoch_slug}.npy", np.eye(dim, dtype=np.float32))
+            write_json(adapter_ready_path(paths, epoch_slug), {
+                "dataset": args.dataset,
+                "encoder": args.encoder,
+                "adapter_slug": epoch_slug,
+                "source_cache": str(cache_path),
+                "epoch": epoch + 1,
+                "pairs": int(len(pair_arr)),
+                "cache_negatives": int(len(neg_rows_all)),
+                "train_negatives": int(len(neg_rows)),
+                "loss": float(epoch_loss),
+                "timestamp": time.time(),
+            })
+            print(f"[stage=train-hard] checkpoint epoch={epoch + 1} slug={epoch_slug}", flush=True)
+
+    torch.save({"state_dict": adapter.state_dict(), "in_dim": dim, "bottleneck": args.adapter_bottleneck}, final_ckpt_path)
+    np.save(paths["inter_dir"] / f"W_{slug}.npy", np.eye(dim, dtype=np.float32))
+    write_json(ready, {
+        "dataset": args.dataset,
+        "encoder": args.encoder,
+        "adapter_slug": slug,
+        "source_cache": str(cache_path),
+        "pairs": int(len(pair_arr)),
+        "cache_negatives": int(len(neg_rows_all)),
+        "train_negatives": int(len(neg_rows)),
+        "epochs": int(args.adapter_epochs),
+        "epoch_losses": [float(x) for x in epoch_losses],
+        "timestamp": time.time(),
+    })
+    print(f"[stage=train-hard] ADAPTER_READY written: {ready}", flush=True)
+
+
 def eval_retrieval(args):
     paths = get_paths(args)
     mode_tag = args.mode
-    out_dir = Path(args.run_root) / args.dataset / paths["tag"] / f"nlist{args.nlist}" / f"np{args.nprobe}" / mode_tag / f"adapter_{args.adapter}"
+    adapter_result_tag = args.result_adapter_tag or args.adapter
+    out_dir = Path(args.run_root) / args.dataset / paths["tag"] / f"nlist{args.nlist}" / f"np{args.nprobe}" / mode_tag / f"adapter_{adapter_result_tag}"
     summary_json = out_dir / "summary.json"
     if summary_json.exists() and not args.force:
         print(f"[skip] summary exists: {summary_json}", flush=True)
@@ -693,7 +1045,9 @@ def eval_retrieval(args):
         "encoder": args.encoder,
         "encoder_tag": paths["tag"],
         "mode": args.mode,
-        "adapter": args.adapter,
+        "adapter": adapter_result_tag,
+        "adapter_mode": args.adapter,
+        "adapter_slug": adapter_slug(args, paths["tag"]) if args.adapter == "on" else "",
         "nlist": args.nlist,
         "nprobe": args.nprobe,
         "k2": args.k2,
@@ -719,12 +1073,25 @@ def eval_retrieval(args):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--stage", choices=["build-index", "train-adapter", "prep", "eval"], required=True)
+    parser.add_argument(
+        "--stage",
+        choices=[
+            "build-index",
+            "train-adapter",
+            "prep",
+            "mine-hard-negatives",
+            "merge-hard-negatives",
+            "train-from-neg-cache",
+            "eval",
+        ],
+        required=True,
+    )
     parser.add_argument("--dataset", required=True)
     parser.add_argument("--encoder", required=True)
     parser.add_argument("--mode", choices=["ivf", "dts111", "dts242"], default="ivf")
     parser.add_argument("--adapter", choices=["off", "on"], default="off")
     parser.add_argument("--adapter_slug", default="")
+    parser.add_argument("--result_adapter_tag", default="")
     parser.add_argument("--adapter_source_slug", default="")
     parser.add_argument("--adapter_train_split", default="train")
     parser.add_argument("--adapter_device", default="auto")
@@ -739,6 +1106,14 @@ def main():
     parser.add_argument("--adapter_max_queries", type=int, default=50000)
     parser.add_argument("--adapter_max_pairs", type=int, default=100000)
     parser.add_argument("--adapter_progress_every", type=int, default=25)
+    parser.add_argument("--adapter_checkpoint_epochs", default="1,2,3,5")
+    parser.add_argument("--hard_cache_root", default="")
+    parser.add_argument("--hard_ms", default="1,1,1")
+    parser.add_argument("--hard_max_queries", type=int, default=0)
+    parser.add_argument("--hard_num_shards", type=int, default=1)
+    parser.add_argument("--hard_shard_id", type=int, default=0)
+    parser.add_argument("--hard_negatives_per_query", type=int, default=10)
+    parser.add_argument("--hard_train_negatives", type=int, default=50000)
     parser.add_argument("--data_root", default=os.getenv("DATA_ROOT", "/mnt/work/VectorDB_MICRO/datasets/semantic"))
     parser.add_argument("--intermediate_root", default=os.getenv("INTERMEDIATE_ROOT", "/mnt/work/VectorDB_MICRO/intermediate_data"))
     parser.add_argument("--index_root", default=os.getenv("INDEX_ROOT", "/mnt/work/VectorDB_MICRO/large_scale_indices"))
@@ -772,6 +1147,12 @@ def main():
         print("[stage=prep] index phase complete; starting adapter phase", flush=True)
         train_adapter(args)
         print("[stage=prep] complete INDEX_READY and ADAPTER_READY", flush=True)
+    elif args.stage == "mine-hard-negatives":
+        mine_hard_negatives(args)
+    elif args.stage == "merge-hard-negatives":
+        merge_hard_negatives(args)
+    elif args.stage == "train-from-neg-cache":
+        train_adapter_from_neg_cache(args)
     else:
         eval_retrieval(args)
 
