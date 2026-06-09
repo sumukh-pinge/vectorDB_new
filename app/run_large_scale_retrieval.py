@@ -93,6 +93,28 @@ def scan_positive_doc_rows(corpus_file: Path, wanted_docids: set[str]):
     return doc_to_row
 
 
+def scan_positive_doc_rows_with_progress(corpus_file: Path, wanted_docids: set[str], progress_every: int):
+    doc_to_row = {}
+    if not wanted_docids:
+        return doc_to_row
+    t0 = time.time()
+    with corpus_file.open("r", encoding="utf-8") as handle:
+        for row_idx, line in enumerate(handle):
+            obj = json.loads(line)
+            docid = str(obj["_id"])
+            if docid in wanted_docids:
+                doc_to_row[docid] = row_idx
+                if len(doc_to_row) == len(wanted_docids):
+                    break
+            if progress_every and (row_idx + 1) % progress_every == 0:
+                print(
+                    f"[stage=positive-row-cache] scanned={row_idx + 1} "
+                    f"found={len(doc_to_row)}/{len(wanted_docids)} elapsed_s={time.time() - t0:.1f}",
+                    flush=True,
+                )
+    return doc_to_row
+
+
 def adapter_slug(args, tag):
     return args.adapter_slug or f"large_scale_adapter_{args.dataset}_{tag}_nlist{args.nlist}"
 
@@ -138,6 +160,10 @@ def hard_shard_path(args, paths, shard_id=None):
 
 def hard_merged_path(args, paths):
     return hard_cache_dir(args, paths) / "merged.json"
+
+
+def positive_row_cache_path(args, paths):
+    return hard_cache_dir(args, paths) / "positive_rows.json"
 
 
 def eval_base_out_dir(args, paths):
@@ -673,6 +699,82 @@ def load_training_queries(args, paths):
     return train_paths, queries, query_ids_all, qrels, keep, shard_keep, shard_qids
 
 
+def selected_training_query_rows(args, paths):
+    train_paths = get_paths(argparse.Namespace(**{**vars(args), "qrels_split": args.adapter_train_split}))
+    query_ids_all = load_query_ids_fallback(train_paths["query_ids"], train_paths["queries_jsonl"])
+    qrels = read_qrels(train_paths["qrels"])
+    keep = [i for i, qid in enumerate(query_ids_all) if qid in qrels]
+    max_queries = int(args.hard_max_queries or args.adapter_max_queries or 0)
+    if max_queries:
+        keep = keep[:max_queries]
+    qids = [query_ids_all[i] for i in keep]
+    return train_paths, query_ids_all, qrels, keep, qids
+
+
+def build_positive_row_cache(args):
+    paths = get_paths(args)
+    out_path = positive_row_cache_path(args, paths)
+    if out_path.exists() and not args.force:
+        print(f"[skip] positive row cache exists: {out_path}", flush=True)
+        return
+
+    t0 = time.time()
+    train_paths, query_ids_all, qrels, keep, qids = selected_training_query_rows(args, paths)
+    wanted_docids = set().union(*(qrels[qid] for qid in qids)) if qids else set()
+    print(
+        f"[stage=positive-row-cache] dataset={args.dataset} split={args.adapter_train_split} "
+        f"selected_queries={len(keep)} wanted_docids={len(wanted_docids)} out={out_path}",
+        flush=True,
+    )
+    doc_to_row = scan_positive_doc_rows_with_progress(paths["corpus"], wanted_docids, args.progress_every)
+    missing = sorted(wanted_docids.difference(doc_to_row))
+    obj = {
+        "dataset": args.dataset,
+        "encoder": args.encoder,
+        "encoder_tag": paths["tag"],
+        "adapter_train_split": args.adapter_train_split,
+        "nlist": args.nlist,
+        "nprobe": args.nprobe,
+        "k2": args.k2,
+        "kfinal": args.kfinal,
+        "hard_ms": args.hard_ms,
+        "seed": args.seed,
+        "selected_queries": len(keep),
+        "wanted_docids": len(wanted_docids),
+        "found_docids": len(doc_to_row),
+        "missing_docids": len(missing),
+        "doc_to_row": {str(k): int(v) for k, v in doc_to_row.items()},
+        "missing_docid_examples": missing[:20],
+        "elapsed_s": time.time() - t0,
+        "timestamp": time.time(),
+    }
+    write_json(out_path, obj)
+    print(
+        f"[stage=positive-row-cache] wrote {out_path} "
+        f"found={len(doc_to_row)}/{len(wanted_docids)} elapsed_s={time.time() - t0:.1f}",
+        flush=True,
+    )
+
+
+def load_positive_row_cache(args, paths, wanted_docids):
+    path = positive_row_cache_path(args, paths)
+    if not path.exists():
+        raise FileNotFoundError(
+            f"missing positive row cache: {path}; run --stage build-positive-row-cache first"
+        )
+    cache = json.loads(path.read_text())
+    raw = cache.get("doc_to_row", {})
+    doc_to_row = {str(docid): int(row) for docid, row in raw.items() if str(docid) in wanted_docids}
+    missing = wanted_docids.difference(doc_to_row)
+    if missing:
+        print(
+            f"[stage=mine-hard] positive_row_cache missing={len(missing)}/{len(wanted_docids)} "
+            f"examples={sorted(missing)[:5]}",
+            flush=True,
+        )
+    return doc_to_row
+
+
 def retrieve_rows_for_mining(
     embeddings,
     base_q,
@@ -727,7 +829,7 @@ def mine_hard_negatives(args):
         f"shard_queries={len(shard_keep)} positives={len(wanted_docids)} ms={ms}",
         flush=True,
     )
-    doc_to_row = scan_positive_doc_rows(paths["corpus"], wanted_docids)
+    doc_to_row = load_positive_row_cache(args, paths, wanted_docids)
 
     embeddings = np.load(paths["embeddings"], mmap_mode="r")
     centroids = np.load(paths["artifacts"] / "centroids.npy", mmap_mode="r")
@@ -1249,6 +1351,7 @@ def main():
             "build-index",
             "train-adapter",
             "prep",
+            "build-positive-row-cache",
             "mine-hard-negatives",
             "merge-hard-negatives",
             "train-from-neg-cache",
@@ -1322,6 +1425,8 @@ def main():
         print("[stage=prep] index phase complete; starting adapter phase", flush=True)
         train_adapter(args)
         print("[stage=prep] complete INDEX_READY and ADAPTER_READY", flush=True)
+    elif args.stage == "build-positive-row-cache":
+        build_positive_row_cache(args)
     elif args.stage == "mine-hard-negatives":
         mine_hard_negatives(args)
     elif args.stage == "merge-hard-negatives":
