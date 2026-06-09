@@ -688,14 +688,21 @@ def retrieve_rows_for_mining(
     kfinal,
     score_chunk_size,
     ms,
+    dts_backend="default",
 ):
     q_vec = np.asarray(q_vec, dtype=np.float32)
     q_code = quantize_chunk(q_vec[None, :], vmin, vmax)[0]
     candidate_ids = selected_candidate_ids(centroids, centroids_q, offsets, list_ids, q_vec, q_code, nprobe, ms[0])
     if candidate_ids.size == 0:
         return np.empty(0, dtype=np.int64), 0
-    stage2 = chunked_dts_topk(base_q, candidate_ids, q_code, ms[1], min(k2, candidate_ids.size), score_chunk_size)
-    final = chunked_dts_topk(base_q, stage2, q_code, ms[2], min(kfinal, stage2.size), score_chunk_size)
+    stage2 = chunked_dts_topk(
+        base_q, candidate_ids, q_code, ms[1], min(k2, candidate_ids.size),
+        score_chunk_size, dts_backend
+    )
+    final = chunked_dts_topk(
+        base_q, stage2, q_code, ms[2], min(kfinal, stage2.size),
+        score_chunk_size, dts_backend
+    )
     return final, int(candidate_ids.size)
 
 
@@ -750,7 +757,7 @@ def mine_hard_negatives(args):
         final, raw_count = retrieve_rows_for_mining(
             embeddings, base_q, centroids, centroids_q, offsets, list_ids, vmin, vmax,
             np.asarray(queries[qrow], dtype=np.float32), args.nprobe, args.k2, args.kfinal,
-            args.score_chunk_size, ms,
+            args.score_chunk_size, ms, args.dts_backend,
         )
         raw_counts.append(raw_count)
         pos_set = set(pos_rows)
@@ -782,6 +789,7 @@ def mine_hard_negatives(args):
         "k2": args.k2,
         "kfinal": args.kfinal,
         "ms": list(ms),
+        "dts_backend": args.dts_backend,
         "seed": args.seed,
         "selected_total_queries": len(keep_all),
         "shard_id": args.hard_shard_id,
