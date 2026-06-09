@@ -328,6 +328,22 @@ def dbam_dual_scores(q_code, base_q, alpha, m):
     return (ub_orig.sum(axis=1) + ub_dual.sum(axis=1)).astype(np.int16, copy=False)
 
 
+def dbam_dual_scores_fast(q_code, base_q, alpha, m):
+    if m == 1:
+        upper = np.minimum(q_code.astype(np.int16) + alpha, LEVELS - 1).astype(np.uint8)
+        lower = np.maximum(q_code.astype(np.int16) - alpha, 0).astype(np.uint8)
+        orig = base_q <= upper
+        dual = base_q >= lower
+        return (orig.sum(axis=1) + dual.sum(axis=1)).astype(np.int16, copy=False)
+    if m == 2:
+        upper = np.minimum(q_code.astype(np.int16) + alpha, LEVELS - 1).astype(np.uint8)
+        lower = np.maximum(q_code.astype(np.int16) - alpha, 0).astype(np.uint8)
+        orig = (base_q[:, 0::2] <= upper[0::2]) & (base_q[:, 1::2] <= upper[1::2])
+        dual = (base_q[:, 0::2] >= lower[0::2]) & (base_q[:, 1::2] >= lower[1::2])
+        return (orig.sum(axis=1) + dual.sum(axis=1)).astype(np.int16, copy=False)
+    return dbam_dual_scores(q_code, base_q, alpha, m)
+
+
 def topk_from_scores(ids, scores, k, largest=True):
     if ids.size <= k:
         order = np.argsort(-scores if largest else scores)
@@ -356,13 +372,16 @@ def chunked_l2_topk(embeddings, ids, q_vec, k, chunk_size):
     return best_ids
 
 
-def chunked_dts_topk(base_q, ids, q_code, m, k, chunk_size):
+def chunked_dts_topk(base_q, ids, q_code, m, k, chunk_size, backend="default"):
     best_ids = np.empty(0, dtype=np.int64)
     best_scores = np.empty(0, dtype=np.int16)
     for start in range(0, ids.size, chunk_size):
         chunk_ids = ids[start:start + chunk_size]
         codes = np.asarray(base_q[chunk_ids], dtype=np.uint8)
-        scores = dbam_dual_scores(q_code, codes, alpha=2, m=m)
+        if backend == "fast":
+            scores = dbam_dual_scores_fast(q_code, codes, alpha=2, m=m)
+        else:
+            scores = dbam_dual_scores(q_code, codes, alpha=2, m=m)
         cand_ids = np.concatenate([best_ids, chunk_ids])
         cand_scores = np.concatenate([best_scores, scores])
         best_ids, best_scores = topk_from_scores(cand_ids, cand_scores, min(k, cand_ids.size), largest=True)
@@ -835,6 +854,20 @@ def train_adapter_from_neg_cache(args):
     import torch
     import torch.nn.functional as F
 
+    profile_t0 = time.time()
+    last_t = profile_t0
+
+    def profile_mark(name):
+        nonlocal last_t
+        if not args.profile_timings:
+            return
+        now = time.time()
+        print(
+            f"[profile=train-hard] {name} delta_s={now - last_t:.6f} elapsed_s={now - profile_t0:.6f}",
+            flush=True,
+        )
+        last_t = now
+
     paths = get_paths(args)
     cache_path = hard_merged_path(args, paths)
     if not cache_path.exists() and args.hard_num_shards == 1:
@@ -849,9 +882,12 @@ def train_adapter_from_neg_cache(args):
         print(f"[skip] cached-hard adapter already ready: {ready}", flush=True)
         return
 
+    profile_mark("paths_ready")
     cache = json.loads(cache_path.read_text())
+    profile_mark("cache_json_read")
     pairs = cache.get("pairs", [])
     neg_rows_all = [int(x) for x in cache.get("negative_rows", [])]
+    profile_mark("cache_parse_rows")
     if not pairs:
         raise RuntimeError(f"hard-negative cache has no positive pairs: {cache_path}")
     if not neg_rows_all:
@@ -863,18 +899,25 @@ def train_adapter_from_neg_cache(args):
         neg_rows = [neg_rows_all[int(i)] for i in idx]
     else:
         neg_rows = neg_rows_all
+    profile_mark("negative_subset_select")
 
     embeddings = np.load(paths["embeddings"], mmap_mode="r")
+    profile_mark("passage_mmap_open")
     train_paths = get_paths(argparse.Namespace(**{**vars(args), "qrels_split": args.adapter_train_split}))
     queries = np.load(train_paths["queries"], mmap_mode="r")
+    profile_mark("query_mmap_open")
     device = resolve_device(args.adapter_device)
     dim = embeddings.shape[1]
     Adapter = load_adapter_module(dim, args.adapter_bottleneck)
     adapter = Adapter().to(device)
     opt = torch.optim.AdamW(adapter.parameters(), lr=args.adapter_lr, weight_decay=1e-4)
+    profile_mark("adapter_optimizer_init")
     neg_tensor = torch.from_numpy(np.asarray(embeddings[neg_rows], dtype=np.float32)).to(device)
+    profile_mark("negative_embedding_gather_to_tensor")
     neg_tensor = F.normalize(neg_tensor, p=2, dim=1)
+    profile_mark("negative_tensor_normalize")
     pair_arr = np.asarray(pairs[:args.adapter_max_pairs] if args.adapter_max_pairs else pairs, dtype=np.int64)
+    profile_mark("pair_array_build")
     steps_per_epoch = int(math.ceil(len(pair_arr) / args.adapter_qbatch))
     checkpoint_epochs = sorted({int(x.strip()) for x in args.adapter_checkpoint_epochs.split(",") if x.strip()})
     print(
@@ -934,6 +977,7 @@ def train_adapter_from_neg_cache(args):
                 "timestamp": time.time(),
             })
             print(f"[stage=train-hard] checkpoint epoch={epoch + 1} slug={epoch_slug}", flush=True)
+            profile_mark(f"checkpoint_epoch_{epoch + 1}")
 
     torch.save({"state_dict": adapter.state_dict(), "in_dim": dim, "bottleneck": args.adapter_bottleneck}, final_ckpt_path)
     np.save(paths["inter_dir"] / f"W_{slug}.npy", np.eye(dim, dtype=np.float32))
@@ -949,6 +993,7 @@ def train_adapter_from_neg_cache(args):
         "epoch_losses": [float(x) for x in epoch_losses],
         "timestamp": time.time(),
     })
+    profile_mark("final_checkpoint_and_ready")
     print(f"[stage=train-hard] ADAPTER_READY written: {ready}", flush=True)
 
 
@@ -1035,8 +1080,14 @@ def eval_retrieval(args):
             stage2 = chunked_l2_topk(embeddings, candidate_ids, q_vec, min(args.k2, raw_count), args.score_chunk_size)
             final = chunked_l2_topk(embeddings, stage2, q_vec, min(args.kfinal, stage2.size), args.score_chunk_size)
         else:
-            stage2 = chunked_dts_topk(base_q, candidate_ids, q_code, stage_m, min(args.k2, raw_count), args.score_chunk_size)
-            final = chunked_dts_topk(base_q, stage2, q_code, stage_m, min(args.kfinal, stage2.size), args.score_chunk_size)
+            stage2 = chunked_dts_topk(
+                base_q, candidate_ids, q_code, stage_m, min(args.k2, raw_count),
+                args.score_chunk_size, args.dts_backend
+            )
+            final = chunked_dts_topk(
+                base_q, stage2, q_code, stage_m, min(args.kfinal, stage2.size),
+                args.score_chunk_size, args.dts_backend
+            )
         final_list = [int(x) for x in final[:args.kfinal]]
         retrieved.append(final_list)
         raw_counts.append(raw_count)
@@ -1071,6 +1122,7 @@ def eval_retrieval(args):
         "adapter": adapter_result_tag,
         "adapter_mode": args.adapter,
         "adapter_slug": adapter_slug(args, paths["tag"]) if args.adapter == "on" else "",
+        "dts_backend": args.dts_backend,
         "nlist": args.nlist,
         "nprobe": args.nprobe,
         "k2": args.k2,
@@ -1153,7 +1205,7 @@ def merge_eval_shards(args):
         **{k: first.get(k) for k in [
             "dataset", "encoder", "encoder_tag", "mode", "adapter", "adapter_mode",
             "adapter_slug", "nlist", "nprobe", "k2", "kfinal", "qrels_split",
-            "faiss_threads", "score_chunk_size"
+            "faiss_threads", "score_chunk_size", "dts_backend"
         ]},
         "queries": int(len(per_query)),
         "total_queries_before_shard": int(sum(int(s.get("queries", 0)) for s in shard_summaries)),
@@ -1225,6 +1277,7 @@ def main():
     parser.add_argument("--hard_shard_id", type=int, default=0)
     parser.add_argument("--hard_negatives_per_query", type=int, default=10)
     parser.add_argument("--hard_train_negatives", type=int, default=50000)
+    parser.add_argument("--profile_timings", action="store_true")
     parser.add_argument("--data_root", default=os.getenv("DATA_ROOT", "/mnt/work/VectorDB_MICRO/datasets/semantic"))
     parser.add_argument("--intermediate_root", default=os.getenv("INTERMEDIATE_ROOT", "/mnt/work/VectorDB_MICRO/intermediate_data"))
     parser.add_argument("--index_root", default=os.getenv("INDEX_ROOT", "/mnt/work/VectorDB_MICRO/large_scale_indices"))
@@ -1241,6 +1294,7 @@ def main():
     parser.add_argument("--add_batch_size", type=int, default=100000)
     parser.add_argument("--quant_batch_size", type=int, default=200000)
     parser.add_argument("--score_chunk_size", type=int, default=250000)
+    parser.add_argument("--dts_backend", choices=["default", "fast"], default="default")
     parser.add_argument("--progress_every", type=int, default=1000000)
     parser.add_argument("--progress_every_queries", type=int, default=25)
     parser.add_argument("--seed", type=int, default=123)
