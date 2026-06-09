@@ -140,6 +140,22 @@ def hard_merged_path(args, paths):
     return hard_cache_dir(args, paths) / "merged.json"
 
 
+def eval_base_out_dir(args, paths):
+    mode_tag = args.mode
+    adapter_result_tag = args.result_adapter_tag or args.adapter
+    return (
+        Path(args.run_root) / args.dataset / paths["tag"] / f"nlist{args.nlist}"
+        / f"np{args.nprobe}" / mode_tag / f"adapter_{adapter_result_tag}"
+    )
+
+
+def eval_out_dir(args, paths):
+    out_dir = eval_base_out_dir(args, paths)
+    if int(args.eval_num_shards) > 1:
+        out_dir = out_dir / "shards" / f"shard_{args.eval_shard_id:04d}_of_{args.eval_num_shards:04d}"
+    return out_dir
+
+
 def load_adapter_module(in_dim, bottleneck=64):
     import torch
     import torch.nn as nn
@@ -938,13 +954,16 @@ def train_adapter_from_neg_cache(args):
 
 def eval_retrieval(args):
     paths = get_paths(args)
-    mode_tag = args.mode
     adapter_result_tag = args.result_adapter_tag or args.adapter
-    out_dir = Path(args.run_root) / args.dataset / paths["tag"] / f"nlist{args.nlist}" / f"np{args.nprobe}" / mode_tag / f"adapter_{adapter_result_tag}"
+    out_dir = eval_out_dir(args, paths)
     summary_json = out_dir / "summary.json"
     if summary_json.exists() and not args.force:
         print(f"[skip] summary exists: {summary_json}", flush=True)
         return
+    if args.eval_num_shards < 1:
+        raise ValueError("--eval_num_shards must be >= 1")
+    if not (0 <= args.eval_shard_id < args.eval_num_shards):
+        raise ValueError("--eval_shard_id must be in [0, eval_num_shards)")
 
     ready = paths["artifacts"] / "INDEX_READY.json"
     if not ready.exists():
@@ -959,6 +978,9 @@ def eval_retrieval(args):
     keep = [i for i, qid in enumerate(query_ids_all) if qid in qrels]
     if args.max_queries:
         keep = keep[:args.max_queries]
+    total_queries_before_shard = len(keep)
+    if args.eval_num_shards > 1:
+        keep = keep[args.eval_shard_id::args.eval_num_shards]
     query_ids = [query_ids_all[i] for i in keep]
     queries = queries[keep]
     if args.adapter == "on":
@@ -968,7 +990,8 @@ def eval_retrieval(args):
     wanted_docids = set().union(*(qrels[qid] for qid in query_ids)) if query_ids else set()
     print(
         f"[stage=eval] dataset={args.dataset} mode={args.mode} adapter={args.adapter} "
-        f"nlist={args.nlist} nprobe={args.nprobe} queries={len(query_ids)} qrels_positives={len(wanted_docids)}",
+        f"nlist={args.nlist} nprobe={args.nprobe} shard={args.eval_shard_id}/{args.eval_num_shards} "
+        f"queries={len(query_ids)}/{total_queries_before_shard} qrels_positives={len(wanted_docids)}",
         flush=True,
     )
     doc_to_row = scan_positive_doc_rows(paths["corpus"], wanted_docids)
@@ -1054,6 +1077,9 @@ def eval_retrieval(args):
         "kfinal": args.kfinal,
         "qrels_split": args.qrels_split,
         "queries": len(query_ids),
+        "total_queries_before_shard": total_queries_before_shard,
+        "eval_num_shards": int(args.eval_num_shards),
+        "eval_shard_id": int(args.eval_shard_id),
         "missing_positive_qrels": missing_qrels,
         "timing_load_s": t_load,
         "timing_eval_s": t_eval,
@@ -1071,6 +1097,90 @@ def eval_retrieval(args):
     print(f"[stage=eval] summary written: {summary_json}", flush=True)
 
 
+def merge_eval_shards(args):
+    paths = get_paths(args)
+    base_dir = eval_base_out_dir(args, paths)
+    summary_json = base_dir / "summary.json"
+    if summary_json.exists() and not args.force:
+        print(f"[skip] merged eval summary exists: {summary_json}", flush=True)
+        return
+    if args.eval_num_shards < 2:
+        raise ValueError("--eval_num_shards must be >= 2 for merge-eval-shards")
+
+    shard_summaries = []
+    per_query = []
+    missing = []
+    for shard_id in range(args.eval_num_shards):
+        shard_dir = base_dir / "shards" / f"shard_{shard_id:04d}_of_{args.eval_num_shards:04d}"
+        s_path = shard_dir / "summary.json"
+        p_path = shard_dir / "per_query.csv"
+        if not s_path.exists() or not p_path.exists():
+            missing.append(str(s_path))
+            continue
+        shard_summaries.append(json.loads(s_path.read_text()))
+        with p_path.open("r", newline="") as f:
+            for row in csv.DictReader(f):
+                per_query.append(row)
+    if missing:
+        raise FileNotFoundError(f"missing {len(missing)} shard summaries; first={missing[:3]}")
+    if not per_query:
+        raise RuntimeError("no per-query rows found in eval shards")
+
+    for row in per_query:
+        for key in ["raw_candidates", "stage2_candidates", "final_candidates", "positives"]:
+            row[key] = int(float(row[key]))
+        for key in ["H@25", "H@100", "R@25", "R@100"]:
+            row[key] = float(row[key])
+
+    raw_counts = [row["raw_candidates"] for row in per_query]
+    stage2_counts = [row["stage2_candidates"] for row in per_query]
+    final_counts = [row["final_candidates"] for row in per_query]
+    metric_row = {
+        "H@25": float(np.mean([row["H@25"] for row in per_query])),
+        "H@100": float(np.mean([row["H@100"] for row in per_query])),
+        "R@25": float(np.mean([row["R@25"] for row in per_query])),
+        "R@100": float(np.mean([row["R@100"] for row in per_query])),
+    }
+    candidate_stats = {}
+    candidate_stats.update(stat_block(raw_counts, "raw_candidates"))
+    candidate_stats.update(stat_block(stage2_counts, "stage2_candidates"))
+    candidate_stats.update(stat_block(final_counts, "final_candidates"))
+
+    first = shard_summaries[0]
+    eval_times = [float(s.get("timing_eval_s", 0.0)) for s in shard_summaries]
+    load_times = [float(s.get("timing_load_s", 0.0)) for s in shard_summaries]
+    merged = {
+        **{k: first.get(k) for k in [
+            "dataset", "encoder", "encoder_tag", "mode", "adapter", "adapter_mode",
+            "adapter_slug", "nlist", "nprobe", "k2", "kfinal", "qrels_split",
+            "faiss_threads", "score_chunk_size"
+        ]},
+        "queries": int(len(per_query)),
+        "total_queries_before_shard": int(sum(int(s.get("queries", 0)) for s in shard_summaries)),
+        "eval_num_shards": int(args.eval_num_shards),
+        "eval_shard_id": "merged",
+        "missing_positive_qrels": int(sum(int(s.get("missing_positive_qrels", 0)) for s in shard_summaries)),
+        "timing_load_s": float(sum(load_times)),
+        "timing_eval_s": float(sum(eval_times)),
+        "timing_eval_wall_s_if_parallel": float(max(eval_times) if eval_times else 0.0),
+        "ms_per_query": float(sum(eval_times) * 1000.0 / len(per_query)),
+        "ms_per_query_wall_if_parallel": float(max(eval_times) * 1000.0 / len(per_query)) if eval_times else 0.0,
+        "qps": float(len(per_query) / sum(eval_times)) if sum(eval_times) > 0 else 0.0,
+        "qps_wall_if_parallel": float(len(per_query) / max(eval_times)) if eval_times and max(eval_times) > 0 else 0.0,
+        **metric_row,
+        **candidate_stats,
+        "timestamp": time.time(),
+    }
+    write_json(summary_json, merged)
+    write_csv(base_dir / "summary.csv", [merged], list(merged.keys()))
+    write_csv(base_dir / "per_query.csv", per_query, list(per_query[0].keys()) if per_query else [])
+    print(
+        f"[stage=merge-eval-shards] wrote {summary_json} queries={len(per_query)} "
+        f"sum_eval_s={sum(eval_times):.2f} max_eval_s={max(eval_times) if eval_times else 0.0:.2f}",
+        flush=True,
+    )
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -1083,6 +1193,7 @@ def main():
             "merge-hard-negatives",
             "train-from-neg-cache",
             "eval",
+            "merge-eval-shards",
         ],
         required=True,
     )
@@ -1134,6 +1245,8 @@ def main():
     parser.add_argument("--progress_every_queries", type=int, default=25)
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--max_queries", type=int, default=0)
+    parser.add_argument("--eval_num_shards", type=int, default=1)
+    parser.add_argument("--eval_shard_id", type=int, default=0)
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
 
@@ -1153,6 +1266,8 @@ def main():
         merge_hard_negatives(args)
     elif args.stage == "train-from-neg-cache":
         train_adapter_from_neg_cache(args)
+    elif args.stage == "merge-eval-shards":
+        merge_eval_shards(args)
     else:
         eval_retrieval(args)
 
